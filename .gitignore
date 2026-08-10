@@ -1,0 +1,4 @@
+work/
+*.upt
+__pycache__/
+*.py[cod]

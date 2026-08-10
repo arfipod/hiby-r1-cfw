@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install firmware test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            genisoimage p7zip-full squashfs-tools
+
+      - name: Check Python syntax
+        run: python -m compileall -q tools tests
+
+      - name: Check POSIX shell syntax
+        run: |
+          while IFS= read -r -d '' file; do
+            if head -n 1 "$file" | grep -qx '#!/bin/sh'; then
+              sh -n "$file"
+            fi
+          done < <(find tools mods tests -type f -print0)
+
+      - name: Run unit and synthetic firmware round-trip tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Reject accidentally committed firmware and build trees
+        run: |
+          if find . -path ./.git -prune -o \
+              \( -name '*.upt' -o -path './work/*' \) -print -quit | grep -q .; then
+            echo 'Firmware images or work/ build artifacts must not be committed.' >&2
+            exit 1
+          fi

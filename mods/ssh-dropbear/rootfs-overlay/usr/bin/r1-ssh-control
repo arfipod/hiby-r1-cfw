@@ -1,0 +1,140 @@
+#!/bin/sh
+
+# Developer Mode owns /usr/data/disableadb in the stock firmware. Reuse the
+# same state: absent means enabled, present means disabled. The monitor also
+# follows Wi-Fi address changes so Dropbear never listens on USB or loopback.
+
+state_dir=/usr/data/dropbear
+host_key=$state_dir/dropbear_ed25519_host_key
+server_pid=/run/dropbear-r1.pid
+monitor_pid=/run/dropbear-r1-monitor.pid
+bound_ip=/run/dropbear-r1.ip
+log_file=$state_dir/dropbear.log
+port=2222
+
+pid_matches() {
+    pid=$1
+    marker=$2
+    [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] &&
+        tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q "$marker"
+}
+
+read_pid() {
+    file=$1
+    if [ -r "$file" ]; then
+        sed -n '1p' "$file"
+    fi
+}
+
+wifi_ipv4() {
+    ip -4 address show dev wlan0 2>/dev/null |
+        awk '/inet / { split($2, address, "/"); print address[1]; exit }'
+}
+
+rotate_log() {
+    [ -f "$log_file" ] || return
+    size=$(wc -c < "$log_file")
+    if [ "$size" -gt 262144 ]; then
+        tail -c 65536 "$log_file" > "$log_file.tmp"
+        mv "$log_file.tmp" "$log_file"
+    fi
+}
+
+stop_server() {
+    pid=$(read_pid "$server_pid")
+    if pid_matches "$pid" dropbear; then
+        kill "$pid" 2>/dev/null || true
+        waited=0
+        while pid_matches "$pid" dropbear && [ "$waited" -lt 5 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if pid_matches "$pid" dropbear; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$server_pid" "$bound_ip"
+}
+
+prepare_state() {
+    mkdir -p "$state_dir"
+    chmod 0700 "$state_dir"
+    if [ -f "$state_dir/authorized_keys" ]; then
+        chmod 0600 "$state_dir/authorized_keys"
+    fi
+    if [ ! -s "$host_key" ]; then
+        /usr/bin/dropbearkey -t ed25519 -f "$host_key" >> "$log_file" 2>&1 || return 1
+        chmod 0600 "$host_key"
+    fi
+}
+
+start_server() {
+    address=$1
+    prepare_state || return 1
+    rotate_log
+    echo "$(date): starting Dropbear on $address:$port" >> "$log_file"
+    /usr/sbin/dropbear \
+        -m -r "$host_key" \
+        -p "$address:$port" -P "$server_pid" \
+        -T 3 -K 30 -I 900 >> "$log_file" 2>&1
+    echo "$address" > "$bound_ip"
+}
+
+monitor() {
+    echo $$ > "$monitor_pid"
+    trap 'stop_server; rm -f "$monitor_pid"; exit 0' INT TERM EXIT
+    while :; do
+        desired_ip=
+        if [ ! -e /usr/data/disableadb ]; then
+            desired_ip=$(wifi_ipv4)
+        fi
+
+        running_pid=$(read_pid "$server_pid")
+        running_ip=
+        [ -r "$bound_ip" ] && running_ip=$(sed -n '1p' "$bound_ip")
+
+        if [ -z "$desired_ip" ]; then
+            stop_server
+        elif ! pid_matches "$running_pid" dropbear || [ "$running_ip" != "$desired_ip" ]; then
+            stop_server
+            start_server "$desired_ip" || true
+        fi
+        sleep 5
+    done
+}
+
+case "${1:-}" in
+    start)
+        pid=$(read_pid "$monitor_pid")
+        if pid_matches "$pid" r1-ssh-control; then
+            exit 0
+        fi
+        "$0" monitor >/dev/null 2>&1 &
+        ;;
+    stop)
+        pid=$(read_pid "$monitor_pid")
+        if pid_matches "$pid" r1-ssh-control; then
+            kill "$pid" 2>/dev/null || true
+        else
+            stop_server
+            rm -f "$monitor_pid"
+        fi
+        ;;
+    monitor)
+        monitor
+        ;;
+    status)
+        pid=$(read_pid "$server_pid")
+        if pid_matches "$pid" dropbear; then
+            address=$(sed -n '1p' "$bound_ip" 2>/dev/null)
+            echo "Dropbear is running as PID $pid on $address:$port"
+            exit 0
+        fi
+        echo "Dropbear is stopped"
+        exit 1
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status|monitor}" >&2
+        exit 1
+        ;;
+esac
