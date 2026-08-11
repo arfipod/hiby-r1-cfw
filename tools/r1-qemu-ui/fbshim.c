@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@
 #define R1_DEFAULT_DMA_PATH "/tmp/r1-qemu-hgl-dma"
 #define R1_DEFAULT_STATE_PATH "/tmp/r1-qemu-frame-state"
 #define R1_DEFAULT_TOUCH_PATH "/tmp/r1-qemu-touch.fifo"
+#define R1_INHERITED_FRAMEBUFFER_FD_ENV "R1_QEMU_INHERITED_FB_FD"
 #define R1_MAX_INPUT_FDS 16U
 #define R1_FRAME_STATE_MAGIC 0x52314642U
 #define R1_CRASH_STATE_MAGIC 0x52314352U
@@ -267,6 +269,38 @@ static int install_segv_diagnostic(void)
     return next_sigaction(SIGSEGV, &action, NULL);
 }
 
+static int register_inherited_framebuffer(void)
+{
+    const char *text = getenv(R1_INHERITED_FRAMEBUFFER_FD_ENV);
+    const unsigned char *cursor;
+    unsigned long value = 0;
+
+    if (!text)
+        return 0;
+    if (!*text)
+        return -1;
+    cursor = (const unsigned char *)text;
+    while (*cursor) {
+        unsigned digit;
+        if (*cursor < '0' || *cursor > '9')
+            return -1;
+        digit = (unsigned)(*cursor - '0');
+        if (value > ((unsigned long)INT_MAX - digit) / 10UL)
+            return -1;
+        value = value * 10UL + digit;
+        ++cursor;
+    }
+    if (fcntl((int)value, F_GETFD) < 0)
+        return -1;
+
+    framebuffer_fd = (int)value;
+    /* The handoff is one-shot.  Do not leak a now process-local descriptor
+     * number into unrelated helpers later launched by the sidecar. */
+    if (unsetenv(R1_INHERITED_FRAMEBUFFER_FD_ENV) != 0)
+        return -1;
+    return 0;
+}
+
 __attribute__((constructor)) static void initialize_shim(void)
 {
     const char *input_log_path;
@@ -274,6 +308,8 @@ __attribute__((constructor)) static void initialize_shim(void)
     const char *crash_log_path;
     const char *state_path;
     resolve_symbols();
+    if (register_inherited_framebuffer() != 0)
+        _exit(190);
     state_path = getenv("R1_QEMU_STATE_PATH");
     if (!state_path || !*state_path)
         state_path = R1_DEFAULT_STATE_PATH;
@@ -482,6 +518,96 @@ int openat64(int directory_fd, const char *path, int flags, ...)
         result = next_openat64(directory_fd, path, flags);
     }
     return result;
+}
+
+/* _FORTIFY_SOURCE rewrites two-argument open calls to these checked glibc
+ * entry points.  The CFW hook is intentionally built with fortification, so
+ * cover the fortified ABI as well as open/open64.  Otherwise its /dev/fb0
+ * and /dev/input opens bypass this emulator-only shim and fail with ENOENT.
+ * Calls that require a mode argument are invalid through this ABI. */
+static int fortified_flags_are_valid(int flags)
+{
+    if (flags & O_CREAT)
+        return 0;
+#ifdef O_TMPFILE
+    if ((flags & O_TMPFILE) == O_TMPFILE)
+        return 0;
+#endif
+    return 1;
+}
+
+int __open_2(const char *path, int flags)
+{
+    if (!fortified_flags_are_valid(flags)) {
+        errno = EINVAL;
+        return -1;
+    }
+    resolve_symbols();
+    if (strcmp(path, "/dev/fb0") == 0)
+        return open_framebuffer_backing();
+    if (strcmp(path, "/dev/sa_hgl_dma") == 0)
+        return open_hgl_dma_backing();
+    if (strcmp(path, "/dev/input/event0") == 0 ||
+        strcmp(path, "/dev/input/event1") == 0)
+        return open_input_backing();
+    return record_open(path, next_open(path, flags));
+}
+
+int __open64_2(const char *path, int flags)
+{
+    if (!fortified_flags_are_valid(flags)) {
+        errno = EINVAL;
+        return -1;
+    }
+    resolve_symbols();
+    if (strcmp(path, "/dev/fb0") == 0)
+        return open_framebuffer_backing();
+    if (strcmp(path, "/dev/sa_hgl_dma") == 0)
+        return open_hgl_dma_backing();
+    if (strcmp(path, "/dev/input/event0") == 0 ||
+        strcmp(path, "/dev/input/event1") == 0)
+        return open_input_backing();
+    return record_open(path, next_open64(path, flags));
+}
+
+int __openat_2(int directory_fd, const char *path, int flags)
+{
+    if (!fortified_flags_are_valid(flags)) {
+        errno = EINVAL;
+        return -1;
+    }
+    resolve_symbols();
+    if (strcmp(path, "/dev/fb0") == 0)
+        return open_framebuffer_backing();
+    if (strcmp(path, "/dev/sa_hgl_dma") == 0)
+        return open_hgl_dma_backing();
+    if (is_event_name(path))
+        return open_input_backing();
+    if (!next_openat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return next_openat64(directory_fd, path, flags);
+}
+
+int __openat64_2(int directory_fd, const char *path, int flags)
+{
+    if (!fortified_flags_are_valid(flags)) {
+        errno = EINVAL;
+        return -1;
+    }
+    resolve_symbols();
+    if (strcmp(path, "/dev/fb0") == 0)
+        return open_framebuffer_backing();
+    if (strcmp(path, "/dev/sa_hgl_dma") == 0)
+        return open_hgl_dma_backing();
+    if (is_event_name(path))
+        return open_input_backing();
+    if (!next_openat64) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return next_openat64(directory_fd, path, flags);
 }
 
 int close(int fd)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import datetime as dt
 import hashlib
 import os
 import re
@@ -23,6 +24,7 @@ from pathlib import Path
 
 CHUNK_RE = re.compile(r"^(?P<image>.+)\.(?P<index>\d{4})\.(?P<md5>[0-9a-f]{32})$")
 CHUNK_SIZE = 512 * 1024
+ISO_SECTOR_SIZE = 2048
 
 
 def source_date_epoch() -> int | None:
@@ -36,6 +38,183 @@ def source_date_epoch() -> int | None:
     if epoch < 0:
         raise RuntimeError("SOURCE_DATE_EPOCH must not be negative")
     return epoch
+
+
+def _both_endian_u32(data: bytes | bytearray, offset: int, label: str) -> int:
+    if offset < 0 or offset + 8 > len(data):
+        raise RuntimeError(f"truncated ISO9660 {label}")
+    little = int.from_bytes(data[offset : offset + 4], "little")
+    big = int.from_bytes(data[offset + 4 : offset + 8], "big")
+    if little != big:
+        raise RuntimeError(f"inconsistent ISO9660 {label}")
+    return little
+
+
+def _rock_ridge_timestamps(epoch: int) -> tuple[bytes, bytes]:
+    moment = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc)
+    if not 1900 <= moment.year <= 2155:
+        raise RuntimeError("SOURCE_DATE_EPOCH is outside the ISO9660 year range")
+    short = bytes(
+        (
+            moment.year - 1900,
+            moment.month,
+            moment.day,
+            moment.hour,
+            moment.minute,
+            moment.second,
+            0,
+        )
+    )
+    long = moment.strftime("%Y%m%d%H%M%S00").encode("ascii") + b"\x00"
+    return short, long
+
+
+def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
+    """Normalize Rock Ridge TF fields without touching ISO payload bytes.
+
+    genisoimage records host ctime and the atime caused by its own reads in
+    Rock Ridge ``TF`` entries. Those values cannot be set with ``os.utime`` and
+    otherwise make byte-identical firmware builds differ. This parser walks
+    only ISO9660 directory System Use areas (including SUSP continuations), so
+    a payload byte sequence that happens to resemble ``TF`` is never changed.
+    """
+
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"ISO9660 image is not a regular file: {path}")
+    image = bytearray(path.read_bytes())
+    short_timestamp, long_timestamp = _rock_ridge_timestamps(epoch)
+
+    primary_offset = None
+    sector = 16
+    while (sector + 1) * ISO_SECTOR_SIZE <= len(image):
+        offset = sector * ISO_SECTOR_SIZE
+        descriptor_type = image[offset]
+        if image[offset + 1 : offset + 6] != b"CD001" or image[offset + 6] != 1:
+            raise RuntimeError(f"invalid ISO9660 volume descriptor at sector {sector}")
+        if descriptor_type == 1 and primary_offset is None:
+            primary_offset = offset
+        if descriptor_type == 255:
+            break
+        sector += 1
+    if primary_offset is None:
+        raise RuntimeError("ISO9660 primary volume descriptor is missing")
+
+    root_offset = primary_offset + 156
+    if root_offset >= len(image) or image[root_offset] < 34:
+        raise RuntimeError("ISO9660 root directory record is invalid")
+    root_extent = _both_endian_u32(image, root_offset + 2, "root extent")
+    root_size = _both_endian_u32(image, root_offset + 10, "root size")
+
+    visited_directories: set[tuple[int, int]] = set()
+    visited_continuations: set[tuple[int, int]] = set()
+    normalized_tf_offsets: set[int] = set()
+
+    def normalize_tf(offset: int, end: int) -> None:
+        length = image[offset + 2]
+        if image[offset + 3] != 1 or length < 5 or offset + length > end:
+            raise RuntimeError("invalid Rock Ridge TF entry")
+        flags = image[offset + 4]
+        timestamp = long_timestamp if flags & 0x80 else short_timestamp
+        count = (flags & 0x7F).bit_count()
+        required = 5 + count * len(timestamp)
+        if required > length:
+            raise RuntimeError("truncated Rock Ridge TF timestamp fields")
+        cursor = offset + 5
+        for _index in range(count):
+            image[cursor : cursor + len(timestamp)] = timestamp
+            cursor += len(timestamp)
+        normalized_tf_offsets.add(offset)
+
+    def normalize_susp(start: int, length: int) -> None:
+        if start < 0 or length < 0 or start + length > len(image):
+            raise RuntimeError("Rock Ridge continuation is outside the ISO image")
+        cursor = start
+        end = start + length
+        while cursor + 4 <= end:
+            signature = bytes(image[cursor : cursor + 2])
+            entry_length = image[cursor + 2]
+            if signature == b"\x00\x00" and entry_length == 0:
+                break
+            if entry_length < 4 or cursor + entry_length > end:
+                raise RuntimeError("invalid Rock Ridge System Use entry")
+            if signature == b"TF":
+                normalize_tf(cursor, end)
+            elif signature == b"CE":
+                if entry_length < 28 or image[cursor + 3] != 1:
+                    raise RuntimeError("invalid Rock Ridge CE entry")
+                extent = _both_endian_u32(image, cursor + 4, "CE extent")
+                continuation_offset = _both_endian_u32(
+                    image, cursor + 12, "CE offset"
+                )
+                continuation_length = _both_endian_u32(
+                    image, cursor + 20, "CE length"
+                )
+                absolute = extent * ISO_SECTOR_SIZE + continuation_offset
+                key = (absolute, continuation_length)
+                if key not in visited_continuations:
+                    visited_continuations.add(key)
+                    normalize_susp(absolute, continuation_length)
+            cursor += entry_length
+
+    def visit_directory(extent: int, directory_size: int) -> None:
+        key = (extent, directory_size)
+        if key in visited_directories:
+            return
+        visited_directories.add(key)
+        base = extent * ISO_SECTOR_SIZE
+        if directory_size <= 0 or base < 0 or base + directory_size > len(image):
+            raise RuntimeError("ISO9660 directory extent is outside the image")
+        position = 0
+        while position < directory_size:
+            record_offset = base + position
+            record_length = image[record_offset]
+            if record_length == 0:
+                position = ((position // ISO_SECTOR_SIZE) + 1) * ISO_SECTOR_SIZE
+                continue
+            record_end = record_offset + record_length
+            if record_length < 34 or record_end > base + directory_size:
+                raise RuntimeError("invalid ISO9660 directory record")
+            name_length = image[record_offset + 32]
+            name_start = record_offset + 33
+            name_end = name_start + name_length
+            if name_end > record_end:
+                raise RuntimeError("truncated ISO9660 file identifier")
+            system_use_start = name_end + (1 if (33 + name_length) & 1 else 0)
+            if system_use_start < record_end:
+                normalize_susp(system_use_start, record_end - system_use_start)
+
+            flags = image[record_offset + 25]
+            identifier = bytes(image[name_start:name_end])
+            if flags & 0x02 and identifier not in (b"\x00", b"\x01"):
+                child_extent = _both_endian_u32(
+                    image, record_offset + 2, "directory extent"
+                )
+                child_size = _both_endian_u32(
+                    image, record_offset + 10, "directory size"
+                )
+                visit_directory(child_extent, child_size)
+            position += record_length
+
+    visit_directory(root_extent, root_size)
+    if not normalized_tf_offsets:
+        raise RuntimeError("no Rock Ridge TF timestamps were found")
+
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), original_mode)
+            output.write(image)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return len(normalized_tf_offsets)
 
 
 def md5_file(path: Path) -> str:
@@ -52,6 +231,37 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def verify_file(
+    path: Path, *, expected_sha256: str | None = None, max_size: int | None = None
+) -> tuple[int, str]:
+    """Verify an exact file digest and/or an inclusive byte-size limit."""
+
+    if expected_sha256 is None and max_size is None:
+        raise RuntimeError("verify-file requires --sha256 and/or --max-size")
+    if expected_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ):
+        raise RuntimeError("expected SHA-256 must be exactly 64 lowercase hex digits")
+    if max_size is not None and max_size < 0:
+        raise RuntimeError("maximum size must not be negative")
+    if not path.is_file():
+        raise RuntimeError(f"file not found: {path}")
+
+    size = path.stat().st_size
+    if max_size is not None and size > max_size:
+        raise RuntimeError(
+            f"file exceeds maximum size: {path}: {size} > {max_size} bytes"
+        )
+
+    actual_sha256 = sha256_file(path)
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"SHA-256 mismatch for {path}: "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+    return size, actual_sha256
 
 
 def find_program(explicit: Path | None, name: str) -> str:
@@ -407,7 +617,13 @@ def command_pack(args: argparse.Namespace) -> None:
         ]
         if epoch is not None:
             command[1:1] = ["-creation-date", str(epoch)]
-        subprocess.run(command, check=True)
+        environment = None
+        if epoch is not None:
+            environment = os.environ.copy()
+            environment["TZ"] = "UTC"
+        subprocess.run(command, check=True, env=environment)
+    if epoch is not None:
+        normalize_iso_rock_ridge_timestamps(output, epoch)
     print(f"firmware: {output.stat().st_size} bytes")
     print(f"md5: {md5_file(output)}")
     print(f"sha256: {sha256_file(output)}")
@@ -415,6 +631,19 @@ def command_pack(args: argparse.Namespace) -> None:
 
 def command_inspect_kernel(args: argparse.Namespace) -> None:
     inspect_uimage(args.ximage.resolve())
+
+
+def command_verify_file(args: argparse.Namespace) -> None:
+    path = args.file.resolve()
+    size, digest = verify_file(
+        path, expected_sha256=args.sha256, max_size=args.max_size
+    )
+    print(f"verified file: {path}")
+    print(f"size: {size} bytes")
+    if args.max_size is not None:
+        print(f"maximum size: {args.max_size} bytes")
+        print(f"headroom: {args.max_size - size} bytes")
+    print(f"sha256: {digest}")
 
 
 def command_apply_overlay(args: argparse.Namespace) -> None:
@@ -564,6 +793,17 @@ def add_force(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    verify = subparsers.add_parser(
+        "verify-file", help="verify a file digest and/or maximum byte size"
+    )
+    verify.add_argument("file", type=Path)
+    verify.add_argument("--sha256", help="expected 64-digit lowercase SHA-256")
+    verify.add_argument(
+        "--max-size", type=int, help="inclusive maximum file size in bytes"
+    )
+    verify.set_defaults(func=command_verify_file)
+
     unpack = subparsers.add_parser("unpack", help="extract ISO and rebuild images")
     unpack.add_argument("firmware", type=Path)
     unpack.add_argument("output", type=Path)

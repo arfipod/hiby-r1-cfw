@@ -52,7 +52,7 @@ class R1QemuBridgeTests(unittest.TestCase):
         up = bridge.touch_events(124, 457, "up")
         self.assertEqual(8 * bridge.INPUT_EVENT.size, len(down))
         self.assertEqual(7 * bridge.INPUT_EVENT.size, len(move))
-        self.assertEqual(3 * bridge.INPUT_EVENT.size, len(up))
+        self.assertEqual(9 * bridge.INPUT_EVENT.size, len(up))
         events = [
             bridge.INPUT_EVENT.unpack_from(down, offset)
             for offset in range(0, len(down), bridge.INPUT_EVENT.size)
@@ -60,6 +60,16 @@ class R1QemuBridgeTests(unittest.TestCase):
         self.assertIn((0, 0, bridge.EV_ABS, bridge.ABS_MT_POSITION_X, 123), events)
         self.assertIn((0, 0, bridge.EV_ABS, bridge.ABS_MT_POSITION_Y, 456), events)
         self.assertEqual((0, 0, bridge.EV_SYN, bridge.SYN_REPORT, 0), events[-1])
+        release = [
+            bridge.INPUT_EVENT.unpack_from(up, offset)
+            for offset in range(0, len(up), bridge.INPUT_EVENT.size)
+        ]
+        self.assertEqual(
+            (0, 0, bridge.EV_ABS, bridge.ABS_MT_TRACKING_ID, -1),
+            release[0],
+        )
+        self.assertIn((0, 0, bridge.EV_KEY, bridge.BTN_TOUCH, 0), release)
+        self.assertEqual((0, 0, bridge.EV_SYN, bridge.SYN_REPORT, 0), release[-1])
 
     def test_touch_is_broadcast_to_every_guest_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

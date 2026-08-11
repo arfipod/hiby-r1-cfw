@@ -2,8 +2,9 @@
 
 This repository contains a reproducible analysis of the HiBy R1 `r1.upt`
 firmware, tools to unpack and rebuild it, resource-export helpers, a diagnostic
-overlay, and an experimental Dropbear SSH CFW. The stock input is never modified
-in place and firmware images are intentionally excluded from Git.
+overlay, Dropbear SSH support, and an experimental launcher/CFW application.
+The stock input is never modified in place and firmware images are intentionally
+excluded from Git.
 
 ## Current status
 
@@ -24,6 +25,16 @@ in place and firmware images are intentionally excluded from Git.
 - The real proprietary `hiby_player` reaches its 480×800 UI under qemu-user
   through emulator-only framebuffer, HGL DMA, evdev touch, alignment, SD, and
   `sys_server` adapters. A safe navigator records curated UI smoke artifacts.
+- CFW 0.1 uses 42 deterministic launcher configurations per stock theme, one
+  guarded runtime route, and an independent MIPS sidecar. The default `0x71`
+  mask shows Music, System, CFW, and About; `0x7f` restores every supported
+  stock and CFW tile with vertical scrolling.
+- The CFW sidecar controls SSH through the existing controller, reports live
+  storage/RAM/system data, persists launcher visibility, and routes Wi-Fi and
+  Bluetooth to the preserved stock Wireless hub.
+- The v0.1 release pipeline prepares and independently re-extracts a candidate,
+  normalizes ISO/Rock Ridge timestamps for byte-reproducible output, and refuses
+  to publish without candidate-bound QEMU PASS evidence.
 - The first SSH lab image has booted on physical R1 hardware and its immutable
   files were matched against the locally re-extracted build. The newer toggle
   image is still treated as experimental until it completes the same cold-boot
@@ -107,6 +118,39 @@ preferred.
 
 For emergency recovery, an empty `CFW_SSH_ENABLE` file in the microSD root
 temporarily overrides both UI gates. Remove it after access is restored.
+
+### Experimental launcher/CFW v0.1
+
+Build the prerequisite Dropbear binary, then prepare a release candidate:
+
+```bash
+tools/bootstrap-ssh-toolchain.sh
+tools/build-dropbear-r1.sh
+tools/build-cfw-0.1.sh prepare r1.upt
+```
+
+`prepare` verifies the exact stock 1.6 UPT SHA-256, works in a separate tree,
+keeps `xImage` byte-identical, enforces the 45 MiB rootfs limit and strict
+rootfs allowlist, packs the candidate, and re-extracts it for independent
+verification. It deliberately does not create the final `dist/` artifact.
+
+After the candidate completes the documented QEMU matrix and its validation
+tool emits a PASS manifest bound to that exact rootfs, publish it with:
+
+```bash
+tools/build-cfw-0.1.sh publish r1.upt
+sha256sum dist/r1-cfw-0.1-experimental.upt
+```
+
+Publication fails closed for missing, unsuccessful, malformed, or stale QEMU
+evidence. No final v0.1 UPT hash is documented before that gate succeeds. See
+[cfw-guide.md](docs/cfw-guide.md) and
+[launcher-research.md](docs/launcher-research.md) for the architecture, exact
+launcher mapping, validation workflow, and remaining hardware-only risks.
+
+These commands only construct and validate local files. They do not flash a
+player, write an MTD device, alter the kernel/recovery image, or install the
+candidate on physical hardware.
 
 ## UI research lab
 

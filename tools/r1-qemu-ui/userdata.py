@@ -36,6 +36,14 @@ IDLE_SHUTDOWN_TIME_OFFSET = 20
 LANGUAGE_ONBOARDING_PENDING_OFFSET = 608
 IDLE_SHUTDOWN_ENABLED_OFFSET = 620
 SLEEP_SHUTDOWN_ENABLED_OFFSET = 624
+ONBOARDING_COMPLETE_OFFSET = 1796
+REGION_CODE_OFFSET = 2068
+REGION_CODE_SIZE = 4
+TIME_ZONE_OFFSET = 2072
+TIME_ZONE_SIZE = 64
+
+QEMU_REGION_CODE = "US"
+QEMU_TIME_ZONE = "America/New_York"
 
 MAGIC = 0x000000FF
 FACTORY_SCHEMA = 0x00000000
@@ -57,6 +65,17 @@ def _read_u32(data: bytes | bytearray, offset: int) -> int:
 
 def _write_u32(data: bytearray, offset: int, value: int) -> None:
     _U32.pack_into(data, offset, value)
+
+
+def _read_fixed_ascii(data: bytes, offset: int, size: int) -> str:
+    return data[offset : offset + size].split(b"\0", 1)[0].decode("ascii", "strict")
+
+
+def _write_fixed_ascii(data: bytearray, offset: int, size: int, value: str) -> None:
+    encoded = value.encode("ascii", "strict")
+    if len(encoded) >= size:
+        raise UserDataError(f"fixed profile string is too long: {value!r}")
+    data[offset : offset + size] = encoded + bytes(size - len(encoded))
 
 
 @dataclass(frozen=True)
@@ -118,6 +137,15 @@ class UserDataProfile:
             "language_onboarding_pending": bool(
                 _read_u32(self.data, LANGUAGE_ONBOARDING_PENDING_OFFSET)
             ),
+            "onboarding_complete": bool(
+                _read_u32(self.data, ONBOARDING_COMPLETE_OFFSET)
+            ),
+            "region_code": _read_fixed_ascii(
+                self.data, REGION_CODE_OFFSET, REGION_CODE_SIZE
+            ),
+            "time_zone": _read_fixed_ascii(
+                self.data, TIME_ZONE_OFFSET, TIME_ZONE_SIZE
+            ),
             "idle_shutdown": {
                 "enabled": bool(
                     _read_u32(self.data, IDLE_SHUTDOWN_ENABLED_OFFSET)
@@ -153,6 +181,20 @@ class UserDataProfile:
         _write_u32(patched, LANGUAGE_ONBOARDING_PENDING_OFFSET, 0)
         _write_u32(patched, IDLE_SHUTDOWN_ENABLED_OFFSET, 0)
         _write_u32(patched, SLEEP_SHUTDOWN_ENABLED_OFFSET, 0)
+        # The stock player still opens Language -> Region -> Time zone when
+        # the earlier language flag is clear unless the independent first-run
+        # completion field and valid region/time-zone strings are present.
+        # These offsets and values were established by comparing the profile
+        # immediately before and after completing that exact stock path under
+        # qemu-user, then confirming that the resulting fields skip onboarding
+        # in a fresh runtime.
+        _write_u32(patched, ONBOARDING_COMPLETE_OFFSET, 1)
+        _write_fixed_ascii(
+            patched, REGION_CODE_OFFSET, REGION_CODE_SIZE, QEMU_REGION_CODE
+        )
+        _write_fixed_ascii(
+            patched, TIME_ZONE_OFFSET, TIME_ZONE_SIZE, QEMU_TIME_ZONE
+        )
         return UserDataProfile.parse(bytes(patched), require_current_schema=True)
 
 

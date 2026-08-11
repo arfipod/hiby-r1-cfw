@@ -1,0 +1,84 @@
+#!/bin/sh
+
+# Select one pre-generated launcher layout after persistent user data is
+# mounted and before hiby_player starts. Any failure leaves the stock launcher
+# untouched, so this optional CFW layer can never block a normal boot.
+
+state_dir=/usr/data/r1-cfw
+config=$state_dir/launcher.conf
+variants=/usr/resource/r1-cfw/launcher
+default_mask=71
+
+read_mask() {
+    mask=$default_mask
+    if [ -r "$config" ]; then
+        candidate=$(sed -n 's/^launcher_mask=\([0-9a-f][0-9a-f]\)$/\1/p' "$config" |
+            sed -n '1p')
+        if [ -n "$candidate" ]; then
+            mask=$candidate
+        fi
+    fi
+    # Only build-generated masks exist. They all retain the CFW entry and at
+    # least four large tiles, so file existence is also the recovery guard.
+    if [ ! -r "$variants/theme1/$mask.view" ]; then
+        mask=$default_mask
+    fi
+    printf '%s\n' "$mask"
+}
+
+bind_variant() {
+    source=$1
+    target=$2
+    [ -r "$source" ] || return 1
+    mountpoint -q "$target" 2>/dev/null && umount "$target" 2>/dev/null || true
+    mount -o bind "$source" "$target"
+}
+
+unmount_variants() {
+    for target in \
+        /usr/resource/layout/theme1/launcher/hiby_launcher_apps.view \
+        /usr/resource/layout/theme2/launcher/hiby_launcher_apps.view \
+        /usr/resource/layout/midi/theme1/launcher/hiby_launcher_apps.view
+    do
+        mountpoint -q "$target" 2>/dev/null && umount "$target" 2>/dev/null || true
+    done
+}
+
+case "${1:-}" in
+    start|reload|restart)
+        mkdir -p "$state_dir" || exit 0
+        chmod 0700 "$state_dir" 2>/dev/null || true
+        mask=$(read_mask)
+
+        # Validate the complete three-theme set before changing any mount. If a
+        # bind later fails, remove every CFW bind so all themes expose their
+        # stock SquashFS files instead of leaving a mixed partial selection.
+        [ -r "$variants/theme1/$mask.view" ] || exit 0
+        [ -r "$variants/theme2/$mask.view" ] || exit 0
+        [ -r "$variants/midi-theme1/$mask.view" ] || exit 0
+        bind_variant "$variants/theme1/$mask.view" \
+            /usr/resource/layout/theme1/launcher/hiby_launcher_apps.view || {
+                unmount_variants
+                exit 0
+            }
+        bind_variant "$variants/theme2/$mask.view" \
+            /usr/resource/layout/theme2/launcher/hiby_launcher_apps.view || {
+                unmount_variants
+                exit 0
+            }
+        bind_variant "$variants/midi-theme1/$mask.view" \
+            /usr/resource/layout/midi/theme1/launcher/hiby_launcher_apps.view || {
+                unmount_variants
+                exit 0
+            }
+        ;;
+    stop)
+        unmount_variants
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|reload|restart}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

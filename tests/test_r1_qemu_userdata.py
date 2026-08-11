@@ -33,6 +33,15 @@ def synthetic_profile(schema: int = userdata.CURRENT_SCHEMA) -> bytes:
     put_u32(blob, userdata.LANGUAGE_ONBOARDING_PENDING_OFFSET, 1)
     put_u32(blob, userdata.IDLE_SHUTDOWN_ENABLED_OFFSET, 1)
     put_u32(blob, userdata.SLEEP_SHUTDOWN_ENABLED_OFFSET, 1)
+    put_u32(blob, userdata.ONBOARDING_COMPLETE_OFFSET, 0)
+    blob[
+        userdata.REGION_CODE_OFFSET : userdata.REGION_CODE_OFFSET
+        + userdata.REGION_CODE_SIZE
+    ] = bytes(userdata.REGION_CODE_SIZE)
+    blob[
+        userdata.TIME_ZONE_OFFSET : userdata.TIME_ZONE_OFFSET
+        + userdata.TIME_ZONE_SIZE
+    ] = bytes(userdata.TIME_ZONE_SIZE)
     return bytes(blob)
 
 
@@ -68,14 +77,30 @@ class UserDataTests(unittest.TestCase):
             userdata.LANGUAGE_ONBOARDING_PENDING_OFFSET,
             userdata.IDLE_SHUTDOWN_ENABLED_OFFSET,
             userdata.SLEEP_SHUTDOWN_ENABLED_OFFSET,
+            userdata.ONBOARDING_COMPLETE_OFFSET,
         ):
             permitted.update(range(offset, offset + 4))
+        permitted.update(
+            range(
+                userdata.REGION_CODE_OFFSET,
+                userdata.REGION_CODE_OFFSET + userdata.REGION_CODE_SIZE,
+            )
+        )
+        permitted.update(
+            range(
+                userdata.TIME_ZONE_OFFSET,
+                userdata.TIME_ZONE_OFFSET + userdata.TIME_ZONE_SIZE,
+            )
+        )
         self.assertLessEqual(changed, permitted)
 
         details = prepared.inspect()
         self.assertEqual("0x0134fe6e", details["schema"])
         self.assertEqual("english", details["language_name"])
         self.assertFalse(details["language_onboarding_pending"])
+        self.assertTrue(details["onboarding_complete"])
+        self.assertEqual("US", details["region_code"])
+        self.assertEqual("America/New_York", details["time_zone"])
         self.assertFalse(details["idle_shutdown"]["enabled"])
         self.assertFalse(details["sleep_shutdown"]["enabled"])
         self.assertEqual(9, details["idle_shutdown"]["time_setting"])

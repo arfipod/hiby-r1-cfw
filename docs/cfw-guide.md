@@ -225,11 +225,177 @@ root before boot. That file intentionally overrides both UI gates while the card
 is inserted. Remove it as soon as normal access and the persistent switch have
 been restored.
 
+CFW 0.1 exposes the same persistent SSH switch on its main page. It calls
+`/usr/bin/r1-ssh-control`; it does not duplicate Dropbear lifecycle logic. An
+enabled switch is only configuration state: an active listener additionally
+requires Developer Mode and a `wlan0` IPv4 address, unless the explicit microSD
+recovery override is present. The UI reports `<wlan0 IPv4>:2222` when an address
+is available and otherwise reports that SSH is enabled without Wi-Fi.
+
 USB is not required for SSH. If testing the stock ADB gadget, select **Device**:
 that makes the R1 a USB peripheral. **OTG** makes the R1 the USB host and cannot
 enumerate it as ADB on the computer.
 
-## 9. Hardware test and recovery discipline
+## 9. Experimental launcher and CFW v0.1
+
+### Architecture
+
+The launcher integration is intentionally hybrid:
+
+```text
+generated external launcher resources
+    + fail-open boot-time layout selector
+    + one guarded in-memory callback route
+    + independent /usr/bin/r1-cfw-ui sidecar
+```
+
+LiteGUI resources define tile geometry, icons, labels, visibility, and touch
+bounds. Stock `hiby_player` descriptors select actions. The optional preload
+hook verifies the exact dormant Step descriptor and callback preimages before
+changing that callback pointer in process memory; it does not patch the launcher
+callback on disk. The pre-existing Developer Options SSH integration remains a
+separate exact, fail-closed stock-1.6 binary patch.
+
+On a CFW tap, the hook transfers the existing framebuffer and touchscreen
+descriptors to the sidecar and waits synchronously. Back, a connectivity route,
+an exec failure, or a child signal restores the framebuffer pages and touch
+ownership. A missing hook or failed runtime guard leaves the stock player
+bootable and the dormant action unchanged.
+
+### Launcher configuration
+
+The seven visibility bits are:
+
+```text
+0x01 Music      0x02 Stream      0x04 Wireless    0x08 eBook
+0x10 System     0x20 CFW         0x40 About
+```
+
+All 42 safe masks retain CFW and at least four large tiles. They are generated
+for all three stock theme paths, giving 126 deterministic layout files. The
+default mask is `0x71` (Music, System, CFW, About). The all-enabled mask is
+`0x7f`; its 984-pixel content surface uses the stock vertical-scroll gesture
+model rather than shrinking touch targets.
+
+The sidecar atomically persists the selected two-digit lowercase hexadecimal
+mask as:
+
+```text
+/usr/data/r1-cfw/launcher.conf
+launcher_mask=71
+```
+
+`S90r1-cfw` validates a complete three-theme variant set before bind-mounting
+it over the stock launcher resources. Missing or malformed state falls back to
+`71`; any partial bind failure removes all CFW binds and exposes the stock
+SquashFS layouts. Changes apply on the next player/userland restart because the
+stock process caches its parsed launcher tree. Hidden Stream, Wireless, and
+eBook tiles remain installed and can be restored; hiding a tile does not remove
+its backend.
+
+### CFW menu
+
+The touch-only 480×800 sidecar provides:
+
+- SSH configuration through `r1-ssh-control`;
+- Wi-Fi and Bluetooth routes to the preserved stock Wireless hub;
+- persistent launcher visibility controls;
+- live internal-storage and mounted-microSD statistics from `statvfs`;
+- RAM data from `/proc/meminfo`;
+- CFW/stock version, kernel, uptime, Wi-Fi IP, and hostname;
+- experimental CFW branding and About information.
+
+Wi-Fi association and Bluetooth scanning/pairing remain stock responsibilities.
+The shared Wireless-hub route preserves both configuration paths even when the
+Wireless launcher tile is hidden. QEMU can validate that route and its Back
+behavior, but not physical radio operation.
+
+### Prepare, validate, publish
+
+The release process is split so a successfully packed image is not automatically
+treated as a distributable image:
+
+```bash
+tools/bootstrap-ssh-toolchain.sh
+tools/build-dropbear-r1.sh
+tools/build-cfw-0.1.sh prepare r1.upt
+```
+
+`prepare` requires the exact HiBy R1 1.6 input SHA-256
+`9aada81995d8d2b2ed80d6cf292c62bc5f0f705e51e4f69c7e766ee67536ba60`.
+It creates
+`work/r1-cfw-0.1/r1-cfw-0.1-experimental.candidate.upt`, then re-extracts and
+verifies the candidate. Checks include the OTA chains, byte-identical stock
+`xImage`, exact patch/resource preimages, payload comparisons, a strict
+added/changed/removed rootfs allowlist, and the 47,185,920-byte main-rootfs
+partition ceiling.
+
+The v0.1 build pins `umask` and `SOURCE_DATE_EPOCH`. UPT packing runs
+`genisoimage` in UTC and normalizes only parsed ISO9660 Rock Ridge `TF`
+timestamps, including continuation areas. Repeated delayed builds from the same
+base and source tree therefore produce byte-identical UPT files. A fail-fast
+lock below `work/r1-cfw-0.1/` covers the complete prepare/publish lifecycle, so
+two invocations cannot mix or replace one another's verification trees. The
+publish copy is also hashed again against the exact UPT verified earlier in the
+same locked run before its atomic rename into `dist/`.
+
+Inspect the fail-closed matrix, then validate the prepared candidate:
+
+```bash
+python3 tools/cfw_validate.py plan
+
+candidate_rootfs_sha256=$(sha256sum \
+  work/r1-cfw-0.1/check/images/rootfs.squashfs | awk '{print $1}')
+
+python3 tools/cfw_validate.py run \
+  --candidate-rootfs-dir work/r1-cfw-0.1/check-rootfs \
+  --candidate-rootfs-image work/r1-cfw-0.1/check/images/rootfs.squashfs \
+  --stock-rootfs-dir work/r1-cfw-0.1/stock-rootfs \
+  --profile work/r1-1.6/rootfs-full/usr/data/user.ini \
+  --runtime-root work/cfw-qemu-validation \
+  --artifacts-dir artifacts/ui/cfw-v0.1 \
+  --expected-rootfs-sha256 "$candidate_rootfs_sha256"
+```
+
+The validator hashes the candidate SquashFS, independently extracts that exact
+image into the disposable per-run runtime, and executes every candidate session
+from that extraction rather than trusting the parallel prepared tree. It hashes
+the image again immediately before writing PASS, so a candidate changed during
+the run cannot inherit its evidence.
+
+The matrix covers the stock baseline; default and all-enabled launchers;
+launcher persistence and scrolling; three sidecar open/Back cycles with
+framebuffer restoration; and a forced sidecar `SIGABRT` followed by proof that
+the player remains alive, its framebuffer is restored, and Music still accepts
+touch input. It also covers SSH off/on; storage, SD, memory, and system pages;
+and the Wi-Fi/Bluetooth stock-hub routes. Hardware radio, DAC, NAND, recovery,
+and board-level behavior are explicitly outside qemu-user coverage.
+
+The validation run writes its ignored evidence below `artifacts/ui/cfw-v0.1/`,
+including a PASS manifest bound to the exact candidate rootfs SHA-256. The
+publish stage independently re-verifies the candidate, all 23 mandatory PASS
+records, and the identity, dimensions, complete PNG structure, and SHA-256 of
+the three featured framebuffer captures. It fails for missing, malformed,
+failed, tampered, or stale evidence:
+
+```bash
+tools/build-cfw-0.1.sh publish r1.upt
+sha256sum dist/r1-cfw-0.1-experimental.upt
+```
+
+Only a successful publish creates
+`dist/r1-cfw-0.1-experimental.upt`. Do not record or rely on a final UPT hash
+before that point.
+
+### Safety boundary
+
+The v0.1 tools only read the immutable stock `r1.upt` and create files under
+dedicated `work/`, `artifacts/`, and `dist/` paths. They do not flash hardware,
+write `/dev/mtd*`, modify the bootloader/kernel/recovery image, format storage,
+or invoke a device updater. Installing a candidate on a physical R1 is outside
+this build and validation workflow.
+
+## 10. Hardware test and recovery discipline
 
 1. Use only normal R1 firmware, never R1 MIDI firmware.
 2. Keep an untouched stock `r1.upt` and its SHA-256 on a separate FAT32 microSD.
@@ -247,7 +413,7 @@ The vendor uses a dedicated recovery kernel/rootfs to validate and write the
 main image; it is not symmetric A/B and does not make an untested application
 patch risk-free.
 
-## 10. CI behavior
+## 11. CI behavior
 
 `.github/workflows/ci.yml` runs on every branch push and every pull request. It:
 
@@ -255,7 +421,8 @@ patch risk-free.
 2. checks Python bytecode compilation;
 3. checks every POSIX shell script with `sh -n`;
 4. runs unit tests for chains, metadata, uImage CRC, JPEG/PNG parsing, overlays,
-   and strict rootfs diffs;
+   strict rootfs diffs, launcher generation/state, guarded integration patches,
+   sidecar data/input behavior, QEMU helpers, and the release evidence gate;
 5. creates, packs, unpacks, and byte-compares a synthetic `.upt` fixture;
 6. fails if firmware images or `work/` build trees are committed.
 
@@ -263,7 +430,7 @@ CI intentionally does not download or redistribute HiBy firmware. The final ABI,
 QEMU, and CFW build commands remain reproducible local gates when `r1.upt` is
 available.
 
-## 11. Adding further features
+## 12. Adding further features
 
 Recommended order of increasing risk:
 

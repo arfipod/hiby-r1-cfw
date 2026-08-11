@@ -4,14 +4,17 @@ import argparse
 import binascii
 import hashlib
 import importlib.util
+import os
 import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +47,56 @@ def make_uimage(payload: bytes, name: bytes = b"CI synthetic kernel") -> bytes:
 
 
 class R1FirmwareUnitTests(unittest.TestCase):
+    def test_rock_ridge_timestamp_encoding_is_utc_and_bounded(self) -> None:
+        short, long = r1fw._rock_ridge_timestamps(1_767_003_664)
+        self.assertEqual(bytes((125, 12, 29, 10, 21, 4, 0)), short)
+        self.assertEqual(b"2025122910210400\x00", long)
+        with self.assertRaisesRegex(RuntimeError, "ISO9660 year range"):
+            r1fw._rock_ridge_timestamps(-2_208_988_801)
+
+    def test_verify_file_accepts_exact_digest_and_size_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "firmware.upt"
+            path.write_bytes(b"exact firmware fixture")
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            self.assertEqual(
+                (path.stat().st_size, expected),
+                r1fw.verify_file(
+                    path,
+                    expected_sha256=expected,
+                    max_size=path.stat().st_size,
+                ),
+            )
+
+    def test_verify_file_rejects_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "firmware.upt"
+            path.write_bytes(b"unexpected firmware")
+
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                r1fw.verify_file(path, expected_sha256="0" * 64)
+
+    def test_verify_file_rejects_one_byte_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "rootfs.squashfs"
+            path.write_bytes(b"12345")
+
+            with self.assertRaisesRegex(RuntimeError, "5 > 4 bytes"):
+                r1fw.verify_file(path, max_size=4)
+
+    def test_verify_file_rejects_invalid_constraints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "input.bin"
+            path.write_bytes(b"fixture")
+
+            with self.assertRaisesRegex(RuntimeError, "requires"):
+                r1fw.verify_file(path)
+            with self.assertRaisesRegex(RuntimeError, "64 lowercase hex"):
+                r1fw.verify_file(path, expected_sha256="not-a-digest")
+            with self.assertRaisesRegex(RuntimeError, "must not be negative"):
+                r1fw.verify_file(path, max_size=-1)
+
     def test_chunk_chain_round_trip_and_tamper_detection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -194,22 +247,40 @@ class R1FirmwareIntegrationTests(unittest.TestCase):
             )
 
             firmware = root / "synthetic.upt"
-            with redirect_stdout(StringIO()):
-                r1fw.command_pack(
-                    argparse.Namespace(
-                        output=firmware,
-                        force=False,
-                        ota_version=0,
-                        ximage=ximage,
-                        rootfs=squashfs,
-                        genisoimage=None,
+            repeated_firmware = root / "synthetic-repeated.upt"
+            with mock.patch.dict(
+                os.environ, {"SOURCE_DATE_EPOCH": "1767003664"}
+            ):
+                with redirect_stdout(StringIO()):
+                    r1fw.command_pack(
+                        argparse.Namespace(
+                            output=firmware,
+                            force=False,
+                            ota_version=0,
+                            ximage=ximage,
+                            rootfs=squashfs,
+                            genisoimage=None,
+                        )
                     )
-                )
-                extracted = root / "extracted"
-                r1fw.command_unpack(
-                    argparse.Namespace(firmware=firmware, output=extracted, force=False)
-                )
+                    time.sleep(1.05)
+                    r1fw.command_pack(
+                        argparse.Namespace(
+                            output=repeated_firmware,
+                            force=False,
+                            ota_version=0,
+                            ximage=ximage,
+                            rootfs=squashfs,
+                            genisoimage=None,
+                        )
+                    )
+                    extracted = root / "extracted"
+                    r1fw.command_unpack(
+                        argparse.Namespace(
+                            firmware=firmware, output=extracted, force=False
+                        )
+                    )
 
+            self.assertEqual(firmware.read_bytes(), repeated_firmware.read_bytes())
             self.assertEqual(ximage.read_bytes(), (extracted / "images/xImage").read_bytes())
             self.assertEqual(
                 squashfs.read_bytes(),

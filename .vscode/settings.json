@@ -1,4 +1,7 @@
 {
+  "files.exclude": {
+    "**/work/**": true
+  },
   "files.watcherExclude": {
     "**/work/**": true
   },
