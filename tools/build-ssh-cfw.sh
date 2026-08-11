@@ -12,7 +12,7 @@ if [ -d "$repo_dir/work/host-tools/usr/bin" ]; then
 fi
 firmware=${1:-$repo_dir/r1.upt}
 work_dir=${R1_SSH_CFW_WORK_DIR:-$repo_dir/work/r1-ssh-cfw}
-output=${R1_SSH_CFW_OUTPUT:-$repo_dir/dist/r1-cfw-ssh-lab-1.6.upt}
+output=${R1_SSH_CFW_OUTPUT:-$repo_dir/dist/r1-cfw-ssh-toggle-1.6.upt}
 stock_unpack=$work_dir/stock
 stock_root=$work_dir/stock-rootfs
 root=$work_dir/rootfs
@@ -47,6 +47,9 @@ ln -sf ../sbin/dropbearmulti "$root/usr/bin/scp"
 chmod 0700 "$root/root/.ssh"
 chmod 0600 "$root/etc/shadow"
 
+python3 "$repo_dir/tools/patch_r1_branding.py" "$root"
+python3 "$repo_dir/tools/patch_r1_ssh_toggle.py" apply "$root"
+
 python3 "$repo_dir/tools/r1fw.py" build-rootfs "$root" "$rootfs_image" --force
 python3 "$repo_dir/tools/r1fw.py" pack \
     --ximage "$stock_unpack/images/xImage" \
@@ -59,7 +62,10 @@ cmp "$stock_unpack/images/xImage" "$check_dir/images/xImage"
 cmp "$rootfs_image" "$check_dir/images/rootfs.squashfs"
 python3 "$repo_dir/tools/r1fw.py" extract-rootfs \
     "$check_dir/images/rootfs.squashfs" "$check_root" --force
-python3 "$repo_dir/tools/r1fw.py" diff-rootfs \
+python3 "$repo_dir/tools/patch_r1_branding.py" "$check_root" --check
+python3 "$repo_dir/tools/patch_r1_ssh_toggle.py" verify "$check_root"
+
+set -- python3 "$repo_dir/tools/r1fw.py" diff-rootfs \
     "$stock_root" "$check_root" \
     --strict \
     --expect-added root/.ssh \
@@ -70,7 +76,33 @@ python3 "$repo_dir/tools/r1fw.py" diff-rootfs \
     --expect-added usr/bin/scp \
     --expect-added usr/sbin/dropbear \
     --expect-added usr/sbin/dropbearmulti \
-    --expect-changed etc/shadow
+    --expect-changed etc/shadow \
+    --expect-changed usr/bin/hiby_player \
+    --expect-changed usr/resource/layout/theme1/hiby_about_dev.view \
+    --expect-changed usr/resource/layout/theme2/hiby_about_dev.view \
+    --expect-changed usr/resource/layout/midi/theme1/hiby_about_dev.view
+
+resource_languages="
+english
+french
+german
+italy
+japanese
+korean
+poland
+russian
+simplified_chinese
+spain
+thai
+traditional_chinese
+ukrainian
+"
+for language in $resource_languages; do
+    set -- "$@" \
+        --expect-changed "usr/resource/str/$language/about_dev.ini" \
+        --expect-changed "usr/resource/str/$language/developer_options.ini"
+done
+"$@"
 
 echo "built and re-verified: $output"
 sha256sum "$output"

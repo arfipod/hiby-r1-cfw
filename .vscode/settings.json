@@ -1,0 +1,11 @@
+{
+  "files.watcherExclude": {
+    "**/work/**": true
+  },
+  "search.exclude": {
+    "**/work/**": true
+  },
+  "python.analysis.exclude": [
+    "**/work/**"
+  ]
+}

@@ -1,15 +1,22 @@
 #!/bin/sh
 
-# Developer Mode owns /usr/data/disableadb in the stock firmware. Reuse the
-# same state: absent means enabled, present means disabled. The monitor also
+# SSH has its own persistent state. Developer Mode remains a master safety gate:
+# both switches must be enabled before Dropbear can listen. A deliberately named
+# file on the microSD can override both gates for recovery. The monitor also
 # follows Wi-Fi address changes so Dropbear never listens on USB or loopback.
 
-state_dir=/usr/data/dropbear
+state_dir=${R1_SSH_STATE_DIR:-/usr/data/dropbear}
 host_key=$state_dir/dropbear_ed25519_host_key
-server_pid=/run/dropbear-r1.pid
-monitor_pid=/run/dropbear-r1-monitor.pid
-bound_ip=/run/dropbear-r1.ip
+enabled_file=$state_dir/enabled
+disabled_file=$state_dir/disabled
+run_dir=${R1_SSH_RUN_DIR:-/run}
+server_pid=$run_dir/dropbear-r1.pid
+monitor_pid=$run_dir/dropbear-r1-monitor.pid
+bound_ip=$run_dir/dropbear-r1.ip
 log_file=$state_dir/dropbear.log
+developer_disabled=${R1_SSH_DEVELOPER_DISABLED:-/usr/data/disableadb}
+sd_root=${R1_SSH_SD_ROOT:-/data/mnt/sd_0}
+recovery_enable=$sd_root/CFW_SSH_ENABLE
 port=2222
 
 pid_matches() {
@@ -29,6 +36,45 @@ read_pid() {
 wifi_ipv4() {
     ip -4 address show dev wlan0 2>/dev/null |
         awk '/inet / { split($2, address, "/"); print address[1]; exit }'
+}
+
+configured_enabled() {
+    [ -e "$enabled_file" ] && return 0
+    [ -e "$disabled_file" ] && return 1
+
+    # Images built before the dedicated toggle generated a host key as soon as
+    # Developer Mode was enabled. Treat that key as the legacy enabled state so
+    # an upgrade does not unexpectedly cut off an active recovery channel.
+    [ -s "$host_key" ]
+}
+
+migrate_legacy_state() {
+    [ ! -e "$enabled_file" ] || return 0
+    [ ! -e "$disabled_file" ] || return 0
+    [ -s "$host_key" ] || return 0
+    mkdir -p "$state_dir"
+    touch "$enabled_file"
+    chmod 0600 "$enabled_file"
+}
+
+set_enabled() {
+    mkdir -p "$state_dir"
+    chmod 0700 "$state_dir"
+    touch "$enabled_file" || return 1
+    chmod 0600 "$enabled_file"
+    rm -f "$disabled_file"
+}
+
+set_disabled() {
+    mkdir -p "$state_dir"
+    chmod 0700 "$state_dir"
+    touch "$disabled_file" || return 1
+    chmod 0600 "$disabled_file"
+    rm -f "$enabled_file"
+}
+
+recovery_requested() {
+    [ -e "$recovery_enable" ]
 }
 
 rotate_log() {
@@ -85,7 +131,8 @@ monitor() {
     trap 'stop_server; rm -f "$monitor_pid"; exit 0' INT TERM EXIT
     while :; do
         desired_ip=
-        if [ ! -e /usr/data/disableadb ]; then
+        if { configured_enabled && [ ! -e "$developer_disabled" ]; } ||
+            recovery_requested; then
             desired_ip=$(wifi_ipv4)
         fi
 
@@ -105,6 +152,7 @@ monitor() {
 
 case "${1:-}" in
     start)
+        migrate_legacy_state || true
         pid=$(read_pid "$monitor_pid")
         if pid_matches "$pid" r1-ssh-control; then
             exit 0
@@ -120,10 +168,42 @@ case "${1:-}" in
             rm -f "$monitor_pid"
         fi
         ;;
+    enable)
+        set_enabled
+        echo "SSH is enabled; Dropbear will follow the wlan0 IPv4 address"
+        ;;
+    disable)
+        set_disabled
+        stop_server
+        echo "SSH is disabled"
+        ;;
+    toggle)
+        if configured_enabled; then
+            "$0" disable
+        else
+            "$0" enable
+        fi
+        ;;
+    is-enabled)
+        if configured_enabled; then
+            echo "enabled"
+            exit 0
+        fi
+        echo "disabled"
+        exit 1
+        ;;
     monitor)
         monitor
         ;;
     status)
+        if configured_enabled; then
+            echo "SSH toggle is enabled"
+        else
+            echo "SSH toggle is disabled"
+        fi
+        if recovery_requested; then
+            echo "microSD recovery override is active: $recovery_enable"
+        fi
         pid=$(read_pid "$server_pid")
         if pid_matches "$pid" dropbear; then
             address=$(sed -n '1p' "$bound_ip" 2>/dev/null)
@@ -134,7 +214,7 @@ case "${1:-}" in
         exit 1
         ;;
     *)
-        echo "Usage: $0 {start|stop|status|monitor}" >&2
+        echo "Usage: $0 {start|stop|enable|disable|toggle|is-enabled|status|monitor}" >&2
         exit 1
         ;;
 esac

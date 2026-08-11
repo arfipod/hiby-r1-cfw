@@ -126,8 +126,10 @@ The stock ADB scripts establish the persistent toggle convention:
 /usr/data/disableadb absent   Developer Mode / ADB enabled
 ```
 
-The SSH modification deliberately follows this existing marker instead of
-binary-patching the proprietary settings UI to add a new widget.
+The first SSH lab image deliberately followed this existing marker, which is why
+SSH started as soon as Developer Mode was already enabled. The newer build adds
+an independent third **SSH server** row to Developer Options. Its persistent
+marker is `/usr/data/dropbear/enabled`; Developer Mode remains a master gate.
 
 ### Boot splash
 
@@ -187,33 +189,45 @@ with size, geometry, target for symlinks, and SHA-256.
 a boolean can expose a UI whose backend is incomplete; enable and test one item
 at a time.
 
-## 7. A/B update behavior
+## 7. Main/recovery update behavior
 
-Readable scripts in `/etc/ota_bin/` implement this flow:
+A hardware capture corrected the initial A/B interpretation. The physical map
+on the tested R1 is:
+
+| MTD | Size | Name | Role |
+|---|---:|---|---|
+| 0 | 512 KiB | `uboot` | bootloader |
+| 1 | 5 MiB | `kernel` | main kernel |
+| 2 | 45 MiB | `rootfs` | full main SquashFS |
+| 3 | 5 MiB | `kernel2` | recovery kernel |
+| 4 | 24 MiB | `rootfs2` | recovery SquashFS |
+| 5 | 512 KiB | `ota` | `ota:kernel[2]` boot marker |
+| 6 | 45 MiB | `userdata` | UBI/UBIFS persistent data |
+
+`rootfs2` is demonstrably not a second main slot: its captured SquashFS is only
+9.95 MiB, contains 1,898 inodes, launches `/usr/bin/recoveryd`, and has no stock
+player UI. Its paired captured `kernel2` begins with the exact stock `xImage`.
+The full firmware 1.6 SquashFS is about 35.8 MiB and cannot fit in that 24 MiB
+partition.
+
+The local-update flow is therefore recovery-assisted:
 
 ```text
-read ota_update.in
-  → select the inactive kernel/rootfs pair
-  → validate each chunk and MD5
-  → flash_erase + nandwrite the inactive images
-  → only after success, write the new ota:kernel[2] marker
+main UI stages the unpacked OTA under /data/autoupdate
+  → boot marker selects kernel2/rootfs2
+  → recoveryd validates chunk chains, sizes, MD5, and uImage CRC
+  → flash_erase + nandwrite update the main kernel/rootfs partitions
+  → only after success, marker returns to ota:kernel
 ```
 
-The marker occupies a 256-byte MTD area. If it says `ota:kernel2`, the updater
-writes pair 1; otherwise it writes pair 2. This reduces interruption risk but
-does not prove automatic rollback when a fully written image fails to boot.
+The scripts reject an image larger than its intended MTD before erasing it. The
+dedicated recovery system is useful protection during staging and validation,
+but this is not symmetric A/B: main rootfs is overwritten, so an interrupted
+write or a boot-crashing main image still requires recovery discipline.
 
-The exact physical MTD numbers, sizes, and kernel arguments still need a device
-capture:
-
-```sh
-cat /proc/mtd
-cat /proc/cmdline
-mount
-dmesg
-```
-
-The diagnostic overlay's `cfw-info.sh` saves these values to the SD card.
+The read-only device backup used for this conclusion is kept under the ignored
+`work/device-backup-10.197.144.114-20260811/` tree. Its recovery kernel, recovery
+rootfs, and OTA-marker dumps have independent SHA-256 hashes.
 
 ## 8. SSH implementation
 
@@ -223,12 +237,19 @@ o32, hard-float and requires only `libcrypt.so.1`, `libc.so.6`, and
 `libutil.so.1`; its newest referenced glibc symbol version is `GLIBC_2.19`.
 
 `S91dropbear` starts a five-second monitor after writable UBIFS is mounted. The
-monitor starts Dropbear only when Developer Mode is enabled and `wlan0` owns an
-IPv4 address. It binds to that exact address on TCP 2222, follows DHCP changes,
-and stops immediately after the marker appears or Wi-Fi goes down.
+monitor starts Dropbear only when the independent SSH marker exists, Developer
+Mode is enabled, and `wlan0` owns an IPv4 address. It binds to that exact address
+on TCP 2222, follows DHCP changes, and stops immediately when either switch is
+disabled or Wi-Fi goes down. A fresh install is off. An existing host key from
+the earlier lab build is migrated to the enabled marker at boot so an update
+does not unexpectedly remove an active recovery path.
 
-Persistent state is `/usr/data/dropbear/`: an ED25519 host key, a bounded log,
-and optional `authorized_keys`. The rootfs has
+An empty `/data/mnt/sd_0/CFW_SSH_ENABLE` file is an explicit emergency override
+for both UI gates. It exists for recovery only and should be removed afterward.
+The Developer Options row shows the persistent marker, not override activity.
+
+Persistent state is `/usr/data/dropbear/`: the `enabled`/`disabled` markers, an
+ED25519 host key, a bounded log, and optional `authorized_keys`. The rootfs has
 `/root/.ssh/authorized_keys -> /usr/data/dropbear/authorized_keys`; this avoids
 Dropbear rejecting stock `/usr` mode 0775 as an authorized-key parent.
 
@@ -281,15 +302,21 @@ Host-verified:
 - manifests, MD5 chains, and uImage CRCs;
 - SquashFS extraction and reconstruction;
 - architecture, SoC evidence, drivers, and init order;
-- A/B update scripts;
+- main/recovery update scripts and physical partition map;
 - asset inventory and modification points;
 - Dropbear ABI, key generation, key/password SSH sessions under QEMU;
 - final CFW re-extraction and exact rootfs change allowlist.
 
+Hardware-verified on the first SSH lab build:
+
+- cold boot through the stock recovery-assisted updater;
+- password SSH on the Wi-Fi-only TCP 2222 listener; and
+- an immutable-file and symlink manifest matching the local extracted image.
+
 Still requires physical hardware:
 
-1. Capture MTD, cmdline, mounts, modules, and dmesg.
-2. Confirm stock recovery and update behavior.
-3. Boot-test the smallest reversible image while keeping a stock SD card ready.
-4. Verify Developer Mode marker transitions and Wi-Fi binding on-device.
+1. Cold-boot the new branding/toggle build and inspect both modified pages.
+2. Verify toggle persistence, Developer Mode gating, and Wi-Fi rebinding.
+3. Verify the microSD recovery override, then remove it.
+4. Keep a stock recovery SD card ready for every binary-hook experiment.
 5. Only then investigate deeper hooks, kernel changes, or bootloader work.

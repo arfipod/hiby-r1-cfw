@@ -1,4 +1,6 @@
 work/
+artifacts/
 *.upt
+test-audio.mp3
 __pycache__/
 *.py[cod]
