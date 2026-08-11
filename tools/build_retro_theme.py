@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build a deterministic Retro Handheld theme from an extracted HiBy R1 light theme.
+"""Build a deterministic Retro Handheld theme from extracted HiBy R1 themes.
 
-The command requires a locally extracted stock theme. It never downloads, embeds,
-or redistributes vendor resources by itself.
+The command requires locally extracted stock resources. It never downloads,
+embeds, or redistributes vendor resources by itself.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-from retro_theme_package import build
+from retro_theme_integration import build
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
