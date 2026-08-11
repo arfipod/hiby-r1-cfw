@@ -65,8 +65,8 @@ jobs:
 
       - name: Reject accidentally committed firmware and build trees
         run: |
-          if find . -path ./.git -prune -o \
-              \( -name '*.upt' -o -path './work/*' \) -print -quit | grep -q .; then
+          if git ls-files -- '*.upt' 'work/**' | grep -q .; then
             echo 'Firmware images or work/ build artifacts must not be committed.' >&2
+            git ls-files -- '*.upt' 'work/**' >&2
             exit 1
           fi
