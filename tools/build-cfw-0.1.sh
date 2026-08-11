@@ -43,6 +43,7 @@ ui_verify_build=$work_dir/ui-verify-build
 retro_theme_work=$work_dir/retro-theme
 retro_verify_work=$work_dir/retro-theme-verify
 retro_expected_paths=$work_dir/retro-theme-expected-paths.txt
+compat_bin=$work_dir/compat-bin
 dropbear=$repo_dir/work/ssh-build/output/dropbearmulti
 ssh_overlay=$repo_dir/mods/ssh-dropbear/rootfs-overlay
 cfw_overlay=$repo_dir/mods/cfw-ui/rootfs-overlay
@@ -62,6 +63,18 @@ if ! flock -n 8; then
     echo "another CFW v0.1 build owns the workspace: $work_dir" >&2
     exit 1
 fi
+
+prepare_genisoimage_compat() {
+    mkdir -p "$compat_bin"
+    cat > "$compat_bin/genisoimage" <<EOF
+#!/bin/sh
+exec python3 "$repo_dir/tools/genisoimage_compat.py" "\$@"
+EOF
+    chmod 0755 "$compat_bin/genisoimage"
+    PATH=$compat_bin:$PATH
+    export PATH
+}
+prepare_genisoimage_compat
 
 verify_stock_input() {
     python3 "$repo_dir/tools/r1fw.py" verify-file "$firmware" \
@@ -87,7 +100,8 @@ require_build_inputs() {
         "$repo_dir/tools/retro_theme_common.py" \
         "$repo_dir/tools/retro_theme_assets.py" \
         "$repo_dir/tools/retro_theme_package.py" \
-        "$repo_dir/tools/retro_theme_integration.py"
+        "$repo_dir/tools/retro_theme_integration.py" \
+        "$repo_dir/tools/genisoimage_compat.py"
     do
         if [ ! -f "$required" ]; then
             echo "missing Retro Handheld build input: $required" >&2
