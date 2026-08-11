@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Legacy sidecar palette. */
 #define COLOR_BLACK 0x0000
 #define COLOR_WHITE 0xffff
 #define COLOR_DIM 0x7bef
@@ -22,6 +23,18 @@
 #define COLOR_HEADER 0x1082
 #define COLOR_ACCENT 0x131e
 #define COLOR_ON 0x07e0
+
+/* Retro Handheld RGB565 design tokens. */
+#define RETRO_CANVAS 0xf77c
+#define RETRO_BRIGHT 0xffde
+#define RETRO_HEADER 0x4a49
+#define RETRO_HEADER_DOT 0x6b4d
+#define RETRO_INK 0x10c3
+#define RETRO_MUTED 0x73ae
+#define RETRO_BORDER 0x9491
+#define RETRO_MINT 0x26d3
+#define RETRO_CYAN 0x055d
+
 #define HEADER_HEIGHT 80
 #define ROW_HEIGHT 72
 
@@ -37,6 +50,8 @@ struct options {
     int launcher_show;
     const char *launcher_name;
     int launcher_enabled;
+    int theme_show;
+    const char *theme_name;
 };
 
 struct ui_state {
@@ -46,6 +61,7 @@ struct ui_state {
     struct r1_cfw_system_info info;
     enum r1_cfw_screen_id screen;
     enum r1_cfw_action_id last_action;
+    enum r1_cfw_theme theme;
     uint32_t launcher_mask;
     uint32_t sequence;
     int route;
@@ -95,6 +111,8 @@ static void usage(FILE *stream, const char *program) {
             "  --dump-info                  print collected key=value data\n"
             "  --launcher-show              print persistent launcher mask\n"
             "  --launcher-set NAME 0|1      update one launcher tile\n"
+            "  --theme-show                 print persistent visual theme\n"
+            "  --theme-set NAME             set stock, light, dark, or retro\n"
             "\n"
             "Emulator-only environment:\n"
             "  R1_CFW_TEST_STATE_PATH       28-byte r1_cfw_test_state record\n"
@@ -142,6 +160,10 @@ static struct options parse_options(int argc, char **argv) {
                 fprintf(stderr, "tile state must be 0 or 1\n");
                 exit(2);
             }
+        } else if (strcmp(argv[index], "--theme-show") == 0) {
+            options.theme_show = 1;
+        } else if (strcmp(argv[index], "--theme-set") == 0 && index + 1 < argc) {
+            options.theme_name = argv[++index];
         } else if (strcmp(argv[index], "--help") == 0) {
             usage(stdout, argv[0]);
             exit(0);
@@ -183,11 +205,28 @@ static int run_data_command(const struct options *options,
         printf("launcher_mask=%02x\n", r1_cfw_launcher_load(paths));
         return 0;
     }
+    if (options->theme_name) {
+        enum r1_cfw_theme theme;
+        int result = r1_cfw_theme_set(paths, options->theme_name, &theme);
+        if (result < 0) {
+            fprintf(stderr, "theme update failed: %d\n", result);
+            return 1;
+        }
+        printf("theme=%s\n", r1_cfw_theme_name(theme));
+        return 0;
+    }
+    if (options->theme_show) {
+        enum r1_cfw_theme theme = r1_cfw_theme_load(paths);
+        printf("theme=%s\n", r1_cfw_theme_name(theme));
+        return 0;
+    }
     if (options->dump_info) {
         struct r1_cfw_system_info info;
+        enum r1_cfw_theme theme = r1_cfw_theme_load(paths);
         r1_cfw_collect_info(paths, &info);
         printf("cfw_version=%s\n", R1_CFW_VERSION);
         printf("stock_version=%s\n", R1_CFW_STOCK_VERSION);
+        printf("theme=%s\n", r1_cfw_theme_name(theme));
         printf("ssh_enabled=%d\n", info.ssh_enabled);
         printf("wifi_ip=%s\n", info.wifi_ip);
         printf("hostname=%s\n", info.hostname);
@@ -208,6 +247,26 @@ static int run_data_command(const struct options *options,
     return -1;
 }
 
+static int retro_active(const struct ui_state *ui) {
+    return ui->theme == R1_CFW_THEME_RETRO;
+}
+
+static uint16_t row_value_color(const struct ui_state *ui, uint16_t legacy) {
+    if (!retro_active(ui)) return legacy;
+    if (legacy == COLOR_ON) return RETRO_MINT;
+    if (legacy == COLOR_ACCENT) return RETRO_CYAN;
+    return RETRO_MUTED;
+}
+
+static void draw_box(struct ui_state *ui, int page, int x, int y,
+                     int width, int height, uint16_t fill, uint16_t border) {
+    r1_display_fill(&ui->display, page, x, y, width, height, fill);
+    r1_display_fill(&ui->display, page, x, y, width, 1, border);
+    r1_display_fill(&ui->display, page, x, y + height - 1, width, 1, border);
+    r1_display_fill(&ui->display, page, x, y, 1, height, border);
+    r1_display_fill(&ui->display, page, x + width - 1, y, 1, height, border);
+}
+
 static const char *screen_title(enum r1_cfw_screen_id screen) {
     switch (screen) {
     case R1_CFW_SCREEN_LAUNCHER: return "LAUNCHER";
@@ -216,14 +275,24 @@ static const char *screen_title(enum r1_cfw_screen_id screen) {
     case R1_CFW_SCREEN_MEMORY: return "MEMORY";
     case R1_CFW_SCREEN_SYSTEM: return "SYSTEM INFO";
     case R1_CFW_SCREEN_ABOUT: return "ABOUT CFW";
+    case R1_CFW_SCREEN_APPEARANCE: return "APPEARANCE";
     default: return "CFW";
     }
 }
 
 static void draw_header(struct ui_state *ui, int page) {
     const char *title = screen_title(ui->screen);
+    uint16_t fill = retro_active(ui) ? RETRO_HEADER : COLOR_HEADER;
+    int x;
+    int y;
     r1_display_fill(&ui->display, page, 0, 0, R1_SCREEN_WIDTH, HEADER_HEIGHT,
-                    COLOR_HEADER);
+                    fill);
+    if (retro_active(ui)) {
+        for (y = 4; y < HEADER_HEIGHT; y += 8)
+            for (x = 4; x < R1_SCREEN_WIDTH; x += 8)
+                r1_display_fill(&ui->display, page, x, y, 2, 2,
+                                RETRO_HEADER_DOT);
+    }
     r1_display_text(&ui->display, page, 20, 25, "<", 4, COLOR_WHITE);
     r1_display_text(&ui->display, page,
                     (R1_SCREEN_WIDTH - r1_display_text_width(title, 3)) / 2,
@@ -233,32 +302,58 @@ static void draw_header(struct ui_state *ui, int page) {
 static void draw_row(struct ui_state *ui, int page, int index,
                      const char *label, const char *value, uint16_t color) {
     int y = HEADER_HEIGHT + index * ROW_HEIGHT;
-    r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
-                    R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
-    r1_display_text(&ui->display, page, 22, y + 25, label, 3, COLOR_WHITE);
+    uint16_t label_color = COLOR_WHITE;
+    if (retro_active(ui)) {
+        draw_box(ui, page, 8, y + 4, R1_SCREEN_WIDTH - 16, ROW_HEIGHT - 8,
+                 RETRO_BRIGHT, RETRO_BORDER);
+        label_color = RETRO_INK;
+    } else {
+        r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
+                        R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
+    }
+    r1_display_text(&ui->display, page, 22, y + 25, label, 3, label_color);
     if (value)
         r1_display_text_right(&ui->display, page, R1_SCREEN_WIDTH - 22,
-                              y + 25, value, 3, color);
+                              y + 25, value, 3,
+                              row_value_color(ui, color));
 }
 
 static void draw_detail_row(struct ui_state *ui, int page, int index,
                             const char *label, const char *value) {
     int y = HEADER_HEIGHT + index * ROW_HEIGHT;
-    r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
-                    R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
-    r1_display_text(&ui->display, page, 22, y + 12, label, 2, COLOR_DIM);
+    uint16_t label_color = COLOR_DIM;
+    uint16_t value_color = COLOR_WHITE;
+    if (retro_active(ui)) {
+        draw_box(ui, page, 8, y + 4, R1_SCREEN_WIDTH - 16, ROW_HEIGHT - 8,
+                 RETRO_BRIGHT, RETRO_BORDER);
+        label_color = RETRO_MUTED;
+        value_color = RETRO_INK;
+    } else {
+        r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
+                        R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
+    }
+    r1_display_text(&ui->display, page, 22, y + 12, label, 2, label_color);
     r1_display_text(&ui->display, page, 22, y + 39,
-                    value && *value ? value : "NOT AVAILABLE", 2, COLOR_WHITE);
+                    value && *value ? value : "NOT AVAILABLE", 2, value_color);
 }
 
 static void draw_ssh_row(struct ui_state *ui, int page, const char *status) {
     int y = HEADER_HEIGHT;
-    r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
-                    R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
+    uint16_t label_color = COLOR_WHITE;
+    if (retro_active(ui)) {
+        draw_box(ui, page, 8, y + 4, R1_SCREEN_WIDTH - 16, ROW_HEIGHT - 8,
+                 RETRO_BRIGHT, RETRO_BORDER);
+        label_color = RETRO_INK;
+    } else {
+        r1_display_fill(&ui->display, page, 0, y + ROW_HEIGHT - 1,
+                        R1_SCREEN_WIDTH, 1, COLOR_DIVIDER);
+    }
     r1_display_text(&ui->display, page, 22, y + 10, "SSH SERVER", 2,
-                    COLOR_WHITE);
+                    label_color);
     r1_display_text(&ui->display, page, 22, y + 39, status, 2,
-                    ui->info.ssh_enabled ? COLOR_ON : COLOR_DIM);
+                    ui->info.ssh_enabled
+                        ? row_value_color(ui, COLOR_ON)
+                        : row_value_color(ui, COLOR_DIM));
 }
 
 static void draw_main(struct ui_state *ui, int page) {
@@ -292,6 +387,7 @@ static void draw_main(struct ui_state *ui, int page) {
 
 static void draw_launcher(struct ui_state *ui, int page) {
     unsigned index;
+    uint16_t note_color = row_value_color(ui, COLOR_ACCENT);
     for (index = 0; index < 7; ++index) {
         uint32_t bit = r1_cfw_launcher_bit(index);
         char label[32];
@@ -302,15 +398,15 @@ static void draw_launcher(struct ui_state *ui, int page) {
                  (ui->launcher_mask & bit) ? COLOR_ON : COLOR_DIM);
     }
     r1_display_text(&ui->display, page, 22, 718,
-                    "APPLIES ON NEXT PLAYER RESTART", 2, COLOR_ACCENT);
+                    "APPLIES ON NEXT PLAYER RESTART", 2, note_color);
     if (ui->launcher_notice) {
         int width = r1_display_text_width(ui->launcher_notice, 1);
         r1_display_text(&ui->display, page,
                         (R1_SCREEN_WIDTH - width) / 2, 752,
-                        ui->launcher_notice, 1, COLOR_ACCENT);
+                        ui->launcher_notice, 1, note_color);
     } else {
         r1_display_text(&ui->display, page, 22, 748,
-                        "CFW LOCKED ON / 4 TO 6 TILES", 2, COLOR_ACCENT);
+                        "CFW LOCKED ON / 4 TO 6 TILES", 2, note_color);
     }
 }
 
@@ -362,6 +458,25 @@ static void draw_about(struct ui_state *ui, int page) {
     draw_detail_row(ui, page, 1, "VERSION", R1_CFW_VERSION);
     draw_detail_row(ui, page, 2, "BASE", "HIBY R1 FIRMWARE 1.6");
     draw_detail_row(ui, page, 3, "STATUS", "EXPERIMENTAL");
+    draw_detail_row(ui, page, 4, "APPEARANCE",
+                    r1_cfw_theme_label(ui->theme));
+}
+
+static void draw_appearance(struct ui_state *ui, int page) {
+    static const char *labels[] = {
+        "SYSTEM DEFAULT", "LIGHT", "DARK", "RETRO HANDHELD"
+    };
+    unsigned index;
+    uint16_t note_color = row_value_color(ui, COLOR_ACCENT);
+    for (index = 0; index < R1_CFW_THEME_COUNT; ++index) {
+        draw_row(ui, page, (int)index, labels[index],
+                 ui->theme == (enum r1_cfw_theme)index ? "SELECTED" : NULL,
+                 COLOR_ON);
+    }
+    r1_display_text(&ui->display, page, 22, 402,
+                    "PLAYER THEME APPLIES AFTER RESTART", 2, note_color);
+    r1_display_text(&ui->display, page, 22, 432,
+                    "CFW PREVIEW UPDATES IMMEDIATELY", 2, note_color);
 }
 
 static void publish_test_state(struct ui_state *ui) {
@@ -391,7 +506,8 @@ static void publish_test_state(struct ui_state *ui) {
 
 static void render(struct ui_state *ui) {
     int page = ui->display.active_page ? 0 : 1;
-    r1_display_clear(&ui->display, page, COLOR_BLACK);
+    r1_display_clear(&ui->display, page,
+                     retro_active(ui) ? RETRO_CANVAS : COLOR_BLACK);
     draw_header(ui, page);
     switch (ui->screen) {
     case R1_CFW_SCREEN_MAIN: draw_main(ui, page); break;
@@ -403,6 +519,7 @@ static void render(struct ui_state *ui) {
     case R1_CFW_SCREEN_MEMORY: draw_memory(ui, page); break;
     case R1_CFW_SCREEN_SYSTEM: draw_system(ui, page); break;
     case R1_CFW_SCREEN_ABOUT: draw_about(ui, page); break;
+    case R1_CFW_SCREEN_APPEARANCE: draw_appearance(ui, page); break;
     default: break;
     }
     r1_display_pan(&ui->display, page);
@@ -413,6 +530,7 @@ static void render(struct ui_state *ui) {
 static void refresh_info(struct ui_state *ui) {
     r1_cfw_collect_info(&ui->paths, &ui->info);
     ui->launcher_mask = r1_cfw_launcher_load(&ui->paths);
+    ui->theme = r1_cfw_theme_load(&ui->paths);
 }
 
 static void go_to_page(struct ui_state *ui, enum r1_cfw_screen_id screen) {
@@ -428,6 +546,9 @@ static void handle_back(struct ui_state *ui) {
     if (ui->screen == R1_CFW_SCREEN_MAIN) {
         ui->route = R1_CFW_ROUTE_BACK;
         stop_requested = 1;
+    } else if (ui->screen == R1_CFW_SCREEN_APPEARANCE) {
+        go_to_page(ui, R1_CFW_SCREEN_ABOUT);
+        ui->last_action = R1_CFW_ACTION_BACK;
     } else {
         go_to_page(ui, R1_CFW_SCREEN_MAIN);
         ui->last_action = R1_CFW_ACTION_BACK;
@@ -489,6 +610,23 @@ static void handle_launcher_tap(struct ui_state *ui, int row) {
     ui->redraw = 1;
 }
 
+static void handle_about_tap(struct ui_state *ui, int row) {
+    if (row == 4) go_to_page(ui, R1_CFW_SCREEN_APPEARANCE);
+}
+
+static void handle_appearance_tap(struct ui_state *ui, int row) {
+    enum r1_cfw_theme selected;
+    if (row < 0 || row >= R1_CFW_THEME_COUNT) return;
+    selected = (enum r1_cfw_theme)row;
+    if (r1_cfw_theme_save(&ui->paths, selected) < 0) {
+        ui->last_action = R1_CFW_ACTION_THEME_REJECTED;
+    } else {
+        ui->theme = selected;
+        ui->last_action = R1_CFW_ACTION_THEME_SET;
+    }
+    ui->redraw = 1;
+}
+
 static void handle_gesture(struct ui_state *ui,
                            const struct r1_gesture *gesture) {
     int row;
@@ -507,6 +645,10 @@ static void handle_gesture(struct ui_state *ui,
     if (ui->screen == R1_CFW_SCREEN_MAIN) handle_main_tap(ui, row);
     else if (ui->screen == R1_CFW_SCREEN_LAUNCHER)
         handle_launcher_tap(ui, row);
+    else if (ui->screen == R1_CFW_SCREEN_ABOUT)
+        handle_about_tap(ui, row);
+    else if (ui->screen == R1_CFW_SCREEN_APPEARANCE)
+        handle_appearance_tap(ui, row);
 }
 
 static int environment_milliseconds(const char *name) {

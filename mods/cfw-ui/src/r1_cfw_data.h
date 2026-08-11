@@ -24,6 +24,16 @@ enum r1_cfw_launcher_bit {
 #define R1_CFW_LAUNCHER_LIMIT_MESSAGE \
     "Maximum 6 launcher tiles. Disable one first."
 
+enum r1_cfw_theme {
+    R1_CFW_THEME_STOCK = 0,
+    R1_CFW_THEME_LIGHT = 1,
+    R1_CFW_THEME_DARK = 2,
+    R1_CFW_THEME_RETRO = 3,
+    R1_CFW_THEME_COUNT = 4,
+};
+
+#define R1_CFW_THEME_DEFAULT R1_CFW_THEME_STOCK
+
 struct r1_cfw_paths {
     char proc_root[256];
     char data_dir[256];
@@ -64,6 +74,14 @@ int r1_cfw_launcher_set(const struct r1_cfw_paths *paths, const char *name,
                         int enabled, uint32_t *saved_mask);
 const char *r1_cfw_launcher_name(unsigned index);
 uint32_t r1_cfw_launcher_bit(unsigned index);
+
+enum r1_cfw_theme r1_cfw_theme_load(const struct r1_cfw_paths *paths);
+int r1_cfw_theme_save(const struct r1_cfw_paths *paths,
+                      enum r1_cfw_theme theme);
+int r1_cfw_theme_set(const struct r1_cfw_paths *paths, const char *name,
+                     enum r1_cfw_theme *saved_theme);
+const char *r1_cfw_theme_name(enum r1_cfw_theme theme);
+const char *r1_cfw_theme_label(enum r1_cfw_theme theme);
 
 int r1_cfw_ssh_is_enabled(const struct r1_cfw_paths *paths);
 int r1_cfw_ssh_toggle(const struct r1_cfw_paths *paths);

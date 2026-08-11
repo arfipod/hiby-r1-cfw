@@ -27,14 +27,27 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install firmware test tools
+      - name: Install firmware and emulator test tools
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends \
-            genisoimage p7zip-full squashfs-tools
+            bubblewrap genisoimage p7zip-full qemu-user squashfs-tools
 
       - name: Install UI preview dependency
         run: python -m pip install 'Pillow>=10,<13'
+
+      - name: Prepare reproducible ISO and QEMU compatibility paths
+        run: |
+          mkdir -p "$RUNNER_TEMP/r1-ci-bin" \
+            work/host-tools/qemu-user/usr/bin
+          cat > "$RUNNER_TEMP/r1-ci-bin/genisoimage" <<EOF
+          #!/bin/sh
+          exec python3 "$GITHUB_WORKSPACE/tools/genisoimage_compat.py" "\$@"
+          EOF
+          chmod 0755 "$RUNNER_TEMP/r1-ci-bin/genisoimage"
+          ln -sf "$(command -v qemu-mipsel)" \
+            work/host-tools/qemu-user/usr/bin/qemu-mipsel
+          echo "$RUNNER_TEMP/r1-ci-bin" >> "$GITHUB_PATH"
 
       - name: Check Python syntax
         run: python -m compileall -q tools tests
@@ -52,8 +65,8 @@ jobs:
 
       - name: Reject accidentally committed firmware and build trees
         run: |
-          if find . -path ./.git -prune -o \
-              \( -name '*.upt' -o -path './work/*' \) -print -quit | grep -q .; then
+          if git ls-files -- '*.upt' 'work/**' | grep -q .; then
             echo 'Firmware images or work/ build artifacts must not be committed.' >&2
+            git ls-files -- '*.upt' 'work/**' >&2
             exit 1
           fi

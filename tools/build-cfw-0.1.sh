@@ -40,9 +40,15 @@ check_dir=$work_dir/check
 check_root=$work_dir/check-rootfs
 ui_build=$work_dir/ui-build
 ui_verify_build=$work_dir/ui-verify-build
+retro_theme_work=$work_dir/retro-theme
+retro_verify_work=$work_dir/retro-theme-verify
+retro_expected_paths=$work_dir/retro-theme-expected-paths.txt
+compat_bin=$work_dir/compat-bin
 dropbear=$repo_dir/work/ssh-build/output/dropbearmulti
 ssh_overlay=$repo_dir/mods/ssh-dropbear/rootfs-overlay
 cfw_overlay=$repo_dir/mods/cfw-ui/rootfs-overlay
+retro_theme_tool=$repo_dir/tools/patch_r1_retro_theme.py
+retro_launcher_tool=$repo_dir/tools/patch_r1_retro_launcher.py
 
 # Every mode reuses and, during verification, replaces paths below work_dir.
 # Serialize the complete lifecycle so an accidental parallel prepare/publish
@@ -57,6 +63,18 @@ if ! flock -n 8; then
     echo "another CFW v0.1 build owns the workspace: $work_dir" >&2
     exit 1
 fi
+
+prepare_genisoimage_compat() {
+    mkdir -p "$compat_bin"
+    cat > "$compat_bin/genisoimage" <<EOF
+#!/bin/sh
+exec python3 "$repo_dir/tools/genisoimage_compat.py" "\$@"
+EOF
+    chmod 0755 "$compat_bin/genisoimage"
+    PATH=$compat_bin:$PATH
+    export PATH
+}
+prepare_genisoimage_compat
 
 verify_stock_input() {
     python3 "$repo_dir/tools/r1fw.py" verify-file "$firmware" \
@@ -75,6 +93,25 @@ require_build_inputs() {
             exit 1
         fi
     done
+    for required in \
+        "$retro_theme_tool" \
+        "$retro_launcher_tool" \
+        "$repo_dir/tools/build_retro_theme.py" \
+        "$repo_dir/tools/retro_theme_common.py" \
+        "$repo_dir/tools/retro_theme_assets.py" \
+        "$repo_dir/tools/retro_theme_package.py" \
+        "$repo_dir/tools/retro_theme_integration.py" \
+        "$repo_dir/tools/genisoimage_compat.py"
+    do
+        if [ ! -f "$required" ]; then
+            echo "missing Retro Handheld build input: $required" >&2
+            exit 1
+        fi
+    done
+    if ! python3 -c 'import PIL' >/dev/null 2>&1; then
+        echo "Pillow is required to generate the Retro Handheld theme" >&2
+        exit 1
+    fi
 }
 
 require_mode() {
@@ -104,6 +141,7 @@ strict_rootfs_diff() {
         --expect-added usr/resource/r1-cfw/launcher/theme1 \
         --expect-added usr/resource/r1-cfw/launcher/theme2 \
         --expect-added usr/resource/r1-cfw/launcher/midi-theme1 \
+        --expect-added usr/resource/r1-cfw/launcher/retro \
         --expect-added usr/resource/litegui/theme1/launcher/cfw.png \
         --expect-added usr/resource/litegui/theme1/launcher/cfw_s.png \
         --expect-added usr/resource/litegui/theme2/launcher/cfw.png \
@@ -146,12 +184,19 @@ ukrainian
 63 65 66 67 69 6a 6b 6c 6d 6e 6f 71 72 73 74 75
 76 77 78 79 7a 7b 7c 7d 7e
 "
-    for theme in theme1 theme2 midi-theme1; do
+    for theme in theme1 theme2 midi-theme1 retro; do
         for mask in $launcher_masks; do
             set -- "$@" \
                 --expect-added "usr/resource/r1-cfw/launcher/$theme/$mask.view"
         done
     done
+
+    python3 "$retro_theme_tool" expected-paths \
+        "$retro_verify_work/package/retro" > "$retro_expected_paths"
+    while IFS= read -r expected_path; do
+        [ -n "$expected_path" ] || continue
+        set -- "$@" --expect-added "$expected_path"
+    done < "$retro_expected_paths"
     "$@"
 }
 
@@ -191,18 +236,12 @@ verify_candidate() {
         exit 1
     fi
 
-    # Verify and later publish one workspace-owned snapshot. The source
-    # candidate may be outside the locked work directory, so reading it again
-    # after verification would permit a non-cooperating writer to substitute a
-    # different UPT while retaining evidence for the first one.
     staged_tmp=$(mktemp "$work_dir/.verified-candidate.XXXXXX")
     cp "$candidate" "$staged_tmp"
     chmod 0644 "$staged_tmp"
     mv -f "$staged_tmp" "$verified_candidate"
     candidate_upt_sha256=$(sha256sum "$verified_candidate" | awk '{print $1}')
 
-    # Rebuild from the current sources into an independent directory. This
-    # prevents a candidate prepared before a source edit from passing publish.
     "$repo_dir/tools/build-r1-cfw-ui.sh" "$ui_verify_build"
 
     python3 "$repo_dir/tools/r1fw.py" unpack "$firmware" "$stock_unpack" --force
@@ -210,7 +249,6 @@ verify_candidate() {
         "$stock_unpack/images/rootfs.squashfs" "$stock_root" --force
     python3 "$repo_dir/tools/r1fw.py" unpack "$verified_candidate" "$check_dir" --force
 
-    # The kernel and the candidate rootfs are checked as independent payloads.
     cmp "$stock_unpack/images/xImage" "$check_dir/images/xImage"
     cmp "$rootfs_image" "$check_dir/images/rootfs.squashfs"
     python3 "$repo_dir/tools/r1fw.py" verify-file \
@@ -222,6 +260,8 @@ verify_candidate() {
     python3 "$repo_dir/tools/patch_r1_ssh_toggle.py" verify "$check_root"
     python3 "$repo_dir/tools/patch_r1_launcher.py" verify "$check_root"
     python3 "$repo_dir/tools/patch_r1_cfw_integration.py" "$check_root" --check
+    python3 "$retro_theme_tool" verify "$check_root" "$retro_verify_work"
+    python3 "$retro_launcher_tool" verify "$check_root"
     verify_overlay_payloads
     strict_rootfs_diff
 
@@ -261,8 +301,10 @@ prepare_candidate() {
 
     python3 "$repo_dir/tools/patch_r1_branding.py" "$root"
     python3 "$repo_dir/tools/patch_r1_ssh_toggle.py" apply "$root"
-    python3 "$repo_dir/tools/patch_r1_launcher.py" generate "$root"
     python3 "$repo_dir/tools/patch_r1_cfw_integration.py" "$root"
+    python3 "$retro_theme_tool" generate "$root" "$retro_theme_work"
+    python3 "$repo_dir/tools/patch_r1_launcher.py" generate "$root"
+    python3 "$retro_launcher_tool" generate "$root"
 
     python3 "$repo_dir/tools/r1fw.py" build-rootfs "$root" "$rootfs_image" --force
     python3 "$repo_dir/tools/r1fw.py" verify-file \

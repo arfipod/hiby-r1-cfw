@@ -23,6 +23,12 @@ struct launcher_entry {
     uint32_t bit;
 };
 
+struct theme_entry {
+    enum r1_cfw_theme theme;
+    const char *name;
+    const char *label;
+};
+
 static const struct launcher_entry launcher_entries[] = {
     {"music", R1_CFW_TILE_MUSIC},
     {"stream", R1_CFW_TILE_STREAM},
@@ -31,6 +37,13 @@ static const struct launcher_entry launcher_entries[] = {
     {"system", R1_CFW_TILE_SYSTEM},
     {"cfw", R1_CFW_TILE_CFW},
     {"about", R1_CFW_TILE_ABOUT},
+};
+
+static const struct theme_entry theme_entries[] = {
+    {R1_CFW_THEME_STOCK, "stock", "SYSTEM"},
+    {R1_CFW_THEME_LIGHT, "light", "LIGHT"},
+    {R1_CFW_THEME_DARK, "dark", "DARK"},
+    {R1_CFW_THEME_RETRO, "retro", "RETRO"},
 };
 
 static void copy_environment(char *destination, size_t size,
@@ -59,6 +72,10 @@ static int valid_mask(uint32_t mask) {
            count <= R1_CFW_LAUNCHER_MAX_TILES;
 }
 
+static int valid_theme(enum r1_cfw_theme theme) {
+    return theme >= R1_CFW_THEME_STOCK && theme < R1_CFW_THEME_COUNT;
+}
+
 void r1_cfw_paths_init(struct r1_cfw_paths *paths) {
     memset(paths, 0, sizeof(*paths));
     copy_environment(paths->proc_root, sizeof(paths->proc_root),
@@ -77,6 +94,50 @@ static int joined_path(char *output, size_t output_size, const char *root,
                        const char *leaf) {
     int length = snprintf(output, output_size, "%s/%s", root, leaf);
     return length >= 0 && (size_t)length < output_size ? 0 : -ENAMETOOLONG;
+}
+
+static int ensure_data_directory(const struct r1_cfw_paths *paths) {
+    if (mkdir(paths->data_dir, 0700) < 0 && errno != EEXIST) return -errno;
+    if (chmod(paths->data_dir, 0700) < 0 && errno != EROFS) return -errno;
+    return 0;
+}
+
+static int atomic_write_config(const struct r1_cfw_paths *paths,
+                               const char *leaf, const char *content) {
+    char target[512];
+    char temporary[560];
+    int descriptor = -1;
+    int directory_descriptor = -1;
+    int result;
+    size_t length = strlen(content);
+    ssize_t written;
+
+    result = ensure_data_directory(paths);
+    if (result < 0) return result;
+    if (joined_path(target, sizeof(target), paths->data_dir, leaf) < 0)
+        return -ENAMETOOLONG;
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", target,
+                 (long)getpid()) >= (int)sizeof(temporary)) {
+        return -ENAMETOOLONG;
+    }
+    descriptor = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor < 0) return -errno;
+    result = 0;
+    written = write(descriptor, content, length);
+    if (written != (ssize_t)length) result = errno ? -errno : -EIO;
+    if (result == 0 && fsync(descriptor) < 0) result = -errno;
+    if (close(descriptor) < 0 && result == 0) result = -errno;
+    descriptor = -1;
+    if (result == 0 && rename(temporary, target) < 0) result = -errno;
+    if (result < 0) unlink(temporary);
+    if (result == 0) {
+        directory_descriptor = open(paths->data_dir, O_RDONLY | O_DIRECTORY);
+        if (directory_descriptor >= 0) {
+            (void)fsync(directory_descriptor);
+            close(directory_descriptor);
+        }
+    }
+    return result;
 }
 
 uint32_t r1_cfw_launcher_load(const struct r1_cfw_paths *paths) {
@@ -129,39 +190,13 @@ uint32_t r1_cfw_launcher_load(const struct r1_cfw_paths *paths) {
 }
 
 int r1_cfw_launcher_save(const struct r1_cfw_paths *paths, uint32_t mask) {
-    char target[512];
-    char temporary[560];
     char content[32];
-    int descriptor = -1;
-    int directory_descriptor = -1;
-    int result = 0;
-    ssize_t length;
     if (!valid_mask(mask)) return -ERANGE;
-    if (mkdir(paths->data_dir, 0700) < 0 && errno != EEXIST) return -errno;
-    if (joined_path(target, sizeof(target), paths->data_dir, "launcher.conf") < 0)
-        return -ENAMETOOLONG;
-    if (snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", target,
-                 (long)getpid()) >= (int)sizeof(temporary)) {
-        return -ENAMETOOLONG;
+    if (snprintf(content, sizeof(content), "launcher_mask=%02x\n", mask) >=
+        (int)sizeof(content)) {
+        return -EOVERFLOW;
     }
-    descriptor = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (descriptor < 0) return -errno;
-    length = snprintf(content, sizeof(content), "launcher_mask=%02x\n", mask);
-    if (write(descriptor, content, (size_t)length) != length ||
-        fsync(descriptor) < 0) {
-        result = -errno;
-    }
-    if (close(descriptor) < 0 && result == 0) result = -errno;
-    if (result == 0 && rename(temporary, target) < 0) result = -errno;
-    if (result < 0) unlink(temporary);
-    if (result == 0) {
-        directory_descriptor = open(paths->data_dir, O_RDONLY | O_DIRECTORY);
-        if (directory_descriptor >= 0) {
-            (void)fsync(directory_descriptor);
-            close(directory_descriptor);
-        }
-    }
-    return result;
+    return atomic_write_config(paths, "launcher.conf", content);
 }
 
 const char *r1_cfw_launcher_name(unsigned index) {
@@ -201,6 +236,90 @@ int r1_cfw_launcher_set(const struct r1_cfw_paths *paths, const char *name,
     return -ENOENT;
 }
 
+const char *r1_cfw_theme_name(enum r1_cfw_theme theme) {
+    size_t index;
+    for (index = 0; index < sizeof(theme_entries) / sizeof(theme_entries[0]);
+         ++index) {
+        if (theme_entries[index].theme == theme) return theme_entries[index].name;
+    }
+    return theme_entries[0].name;
+}
+
+const char *r1_cfw_theme_label(enum r1_cfw_theme theme) {
+    size_t index;
+    for (index = 0; index < sizeof(theme_entries) / sizeof(theme_entries[0]);
+         ++index) {
+        if (theme_entries[index].theme == theme) return theme_entries[index].label;
+    }
+    return theme_entries[0].label;
+}
+
+int r1_cfw_theme_save(const struct r1_cfw_paths *paths,
+                      enum r1_cfw_theme theme) {
+    char content[48];
+    const char *name;
+    if (!valid_theme(theme)) return -ERANGE;
+    name = r1_cfw_theme_name(theme);
+    if (snprintf(content, sizeof(content), "theme=%s\n", name) >=
+        (int)sizeof(content)) {
+        return -EOVERFLOW;
+    }
+    return atomic_write_config(paths, "theme.conf", content);
+}
+
+enum r1_cfw_theme r1_cfw_theme_load(const struct r1_cfw_paths *paths) {
+    char path[512];
+    char line[80];
+    FILE *stream;
+    size_t index;
+    size_t length;
+
+    if (joined_path(path, sizeof(path), paths->data_dir, "theme.conf") < 0)
+        return R1_CFW_THEME_DEFAULT;
+    stream = fopen(path, "r");
+    if (!stream) return R1_CFW_THEME_DEFAULT;
+    if (!fgets(line, sizeof(line), stream)) {
+        fclose(stream);
+        (void)r1_cfw_theme_save(paths, R1_CFW_THEME_DEFAULT);
+        return R1_CFW_THEME_DEFAULT;
+    }
+    length = strlen(line);
+    if (fgetc(stream) != EOF || ferror(stream)) {
+        fclose(stream);
+        (void)r1_cfw_theme_save(paths, R1_CFW_THEME_DEFAULT);
+        return R1_CFW_THEME_DEFAULT;
+    }
+    fclose(stream);
+    if (length < 8U || strncmp(line, "theme=", 6) != 0 ||
+        line[length - 1] != '\n') {
+        (void)r1_cfw_theme_save(paths, R1_CFW_THEME_DEFAULT);
+        return R1_CFW_THEME_DEFAULT;
+    }
+    line[length - 1] = '\0';
+    for (index = 0; index < sizeof(theme_entries) / sizeof(theme_entries[0]);
+         ++index) {
+        if (strcmp(line + 6, theme_entries[index].name) == 0)
+            return theme_entries[index].theme;
+    }
+    (void)r1_cfw_theme_save(paths, R1_CFW_THEME_DEFAULT);
+    return R1_CFW_THEME_DEFAULT;
+}
+
+int r1_cfw_theme_set(const struct r1_cfw_paths *paths, const char *name,
+                     enum r1_cfw_theme *saved_theme) {
+    size_t index;
+    if (!name) return -EINVAL;
+    for (index = 0; index < sizeof(theme_entries) / sizeof(theme_entries[0]);
+         ++index) {
+        if (strcmp(name, theme_entries[index].name) != 0) continue;
+        if (r1_cfw_theme_save(paths, theme_entries[index].theme) < 0)
+            return -EIO;
+        if (saved_theme) *saved_theme = theme_entries[index].theme;
+        return 0;
+    }
+    return -ENOENT;
+}
+
 static int run_controller(const char *controller, const char *command) {
     const char *emulator_wrapper = getenv("R1_QEMU_EXEC_WRAPPER");
     pid_t child;
@@ -215,12 +334,6 @@ static int run_controller(const char *controller, const char *command) {
             (void)dup2(null_descriptor, STDERR_FILENO);
             if (null_descriptor > STDERR_FILENO) close(null_descriptor);
         }
-        /* A physical R1 executes the controller through its shebang.  In the
-         * qemu-user harness there is no binfmt_misc registration, so a guest
-         * shell script must be launched through the already-mounted host qemu
-         * wrapper and the target shell explicitly.  Resolve the environment
-         * before fork; the child then performs only async-signal-safe setup
-         * and exec calls. */
         if (emulator_wrapper && *emulator_wrapper) {
             execl(emulator_wrapper, emulator_wrapper, "/bin/sh", controller,
                   command, (char *)NULL);
