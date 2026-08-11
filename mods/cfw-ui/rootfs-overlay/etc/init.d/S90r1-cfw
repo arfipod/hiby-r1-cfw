@@ -1,79 +1,218 @@
 #!/bin/sh
 
-# Select one pre-generated launcher layout after persistent user data is
-# mounted and before hiby_player starts. Any failure leaves the stock launcher
-# untouched, so this optional CFW layer can never block a normal boot.
+# Apply the optional launcher configuration and visual theme after writable
+# user data is mounted but before hiby_player starts. Every bind is reversible;
+# any validation or mount failure unwinds the complete transaction and exposes
+# the stock SquashFS resources.
 
-state_dir=/usr/data/r1-cfw
-config=$state_dir/launcher.conf
-variants=/usr/resource/r1-cfw/launcher
+resource_root=${R1_CFW_RESOURCE_ROOT:-/usr/resource}
+state_dir=${R1_CFW_STATE_DIR:-/usr/data/r1-cfw}
+mount_cmd=${R1_CFW_MOUNT:-mount}
+umount_cmd=${R1_CFW_UMOUNT:-umount}
+mountpoint_cmd=${R1_CFW_MOUNTPOINT:-mountpoint}
+
+launcher_config=$state_dir/launcher.conf
+theme_config=$state_dir/theme.conf
+variants=$resource_root/r1-cfw/launcher
+retro_root=$resource_root/r1-cfw/themes/retro
 default_mask=71
+default_theme=stock
+
+layout_theme1=$resource_root/layout/theme1
+layout_theme2=$resource_root/layout/theme2
+layout_midi=$resource_root/layout/midi/theme1
+assets_theme1=$resource_root/litegui/theme1
+assets_theme2=$resource_root/litegui/theme2
+launcher_relative=launcher/hiby_launcher_apps.view
 
 read_mask() {
     mask=$default_mask
-    if [ -r "$config" ]; then
-        candidate=$(sed -n 's/^launcher_mask=\([0-9a-f][0-9a-f]\)$/\1/p' "$config" |
-            sed -n '1p')
-        if [ -n "$candidate" ]; then
-            mask=$candidate
-        fi
-    fi
-    # Only build-generated masks exist. They all retain the CFW entry and at
-    # least four large tiles, so file existence is also the recovery guard.
-    if [ ! -r "$variants/theme1/$mask.view" ]; then
-        mask=$default_mask
+    if [ -r "$launcher_config" ]; then
+        candidate=$(sed -n 's/^launcher_mask=\([0-9a-f][0-9a-f]\)$/\1/p' \
+            "$launcher_config")
+        case "$candidate" in
+            [0-9a-f][0-9a-f]) mask=$candidate ;;
+        esac
     fi
     printf '%s\n' "$mask"
 }
 
-bind_variant() {
-    source=$1
-    target=$2
-    [ -r "$source" ] || return 1
-    mountpoint -q "$target" 2>/dev/null && umount "$target" 2>/dev/null || true
-    mount -o bind "$source" "$target"
+read_theme() {
+    theme=$default_theme
+    if [ -r "$theme_config" ]; then
+        candidate=$(sed -n \
+            's/^theme=\(stock\|light\|dark\|retro\)$/\1/p' \
+            "$theme_config")
+        case "$candidate" in
+            stock|light|dark|retro) theme=$candidate ;;
+        esac
+    fi
+    printf '%s\n' "$theme"
 }
 
-unmount_variants() {
-    for target in \
-        /usr/resource/layout/theme1/launcher/hiby_launcher_apps.view \
-        /usr/resource/layout/theme2/launcher/hiby_launcher_apps.view \
-        /usr/resource/layout/midi/theme1/launcher/hiby_launcher_apps.view
-    do
-        mountpoint -q "$target" 2>/dev/null && umount "$target" 2>/dev/null || true
-    done
+is_mounted() {
+    "$mountpoint_cmd" -q "$1" 2>/dev/null
+}
+
+unmount_one() {
+    target=$1
+    if is_mounted "$target"; then
+        "$umount_cmd" "$target" >/dev/null 2>&1 || true
+    fi
+}
+
+unmount_all() {
+    # Nested file mounts must be removed before their parent directory mounts.
+    unmount_one "$layout_theme1/$launcher_relative"
+    unmount_one "$layout_theme2/$launcher_relative"
+    unmount_one "$layout_midi/$launcher_relative"
+    unmount_one "$assets_theme2"
+    unmount_one "$assets_theme1"
+    unmount_one "$layout_theme2"
+    unmount_one "$layout_theme1"
+}
+
+bind_one() {
+    source=$1
+    target=$2
+    [ -e "$source" ] || return 1
+    [ -e "$target" ] || return 1
+    "$mount_cmd" -o bind "$source" "$target"
+}
+
+validate_retro_tree() {
+    [ -d "$retro_root/layout" ] || return 1
+    [ -d "$retro_root/litegui" ] || return 1
+    [ -r "$retro_root/.r1-theme" ] || return 1
+    [ "$(sed -n '1p' "$retro_root/.r1-theme")" = \
+        "theme=retro-handheld" ] || return 1
+    [ -r "$retro_root/layout/$launcher_relative" ] || return 1
+    [ -r "$retro_root/layout/topbar/topbar.view" ] || return 1
+    [ -r "$retro_root/litegui/launcher/music.png" ] || return 1
+    [ -r "$retro_root/litegui/topbar/retro_bg.png" ] || return 1
+}
+
+validate_plan() {
+    theme=$1
+    mask=$2
+    first_variant=$3
+    second_variant=$4
+
+    [ -d "$layout_theme1" ] || return 1
+    [ -d "$layout_theme2" ] || return 1
+    [ -d "$layout_midi" ] || return 1
+    [ -d "$assets_theme1" ] || return 1
+    [ -d "$assets_theme2" ] || return 1
+    [ -r "$layout_theme1/$launcher_relative" ] || return 1
+    [ -r "$layout_theme2/$launcher_relative" ] || return 1
+    [ -r "$layout_midi/$launcher_relative" ] || return 1
+    [ -r "$variants/$first_variant/$mask.view" ] || return 1
+    [ -r "$variants/$second_variant/$mask.view" ] || return 1
+    [ -r "$variants/midi-theme1/$mask.view" ] || return 1
+
+    case "$theme" in
+        stock) ;;
+        light)
+            [ -d "$layout_theme1" ] && [ -d "$assets_theme1" ] || return 1
+            ;;
+        dark)
+            [ -d "$layout_theme2" ] && [ -d "$assets_theme2" ] || return 1
+            ;;
+        retro)
+            validate_retro_tree || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_theme_directories() {
+    theme=$1
+    case "$theme" in
+        stock)
+            ;;
+        light)
+            bind_one "$layout_theme1" "$layout_theme2" || return 1
+            bind_one "$assets_theme1" "$assets_theme2" || return 1
+            ;;
+        dark)
+            bind_one "$layout_theme2" "$layout_theme1" || return 1
+            bind_one "$assets_theme2" "$assets_theme1" || return 1
+            ;;
+        retro)
+            bind_one "$retro_root/layout" "$layout_theme1" || return 1
+            bind_one "$retro_root/layout" "$layout_theme2" || return 1
+            bind_one "$retro_root/litegui" "$assets_theme1" || return 1
+            bind_one "$retro_root/litegui" "$assets_theme2" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_transaction() {
+    mask=$(read_mask)
+    theme=$(read_theme)
+    case "$theme" in
+        stock)
+            first_variant=theme1
+            second_variant=theme2
+            ;;
+        light)
+            first_variant=theme1
+            second_variant=theme1
+            ;;
+        dark)
+            first_variant=theme2
+            second_variant=theme2
+            ;;
+        retro)
+            first_variant=retro
+            second_variant=retro
+            ;;
+        *)
+            theme=$default_theme
+            first_variant=theme1
+            second_variant=theme2
+            ;;
+    esac
+
+    validate_plan "$theme" "$mask" "$first_variant" "$second_variant" ||
+        return 1
+
+    unmount_all
+    apply_theme_directories "$theme" || {
+        unmount_all
+        return 1
+    }
+    bind_one "$variants/$first_variant/$mask.view" \
+        "$layout_theme1/$launcher_relative" || {
+            unmount_all
+            return 1
+        }
+    bind_one "$variants/$second_variant/$mask.view" \
+        "$layout_theme2/$launcher_relative" || {
+            unmount_all
+            return 1
+        }
+    bind_one "$variants/midi-theme1/$mask.view" \
+        "$layout_midi/$launcher_relative" || {
+            unmount_all
+            return 1
+        }
+    return 0
 }
 
 case "${1:-}" in
     start|reload|restart)
         mkdir -p "$state_dir" || exit 0
         chmod 0700 "$state_dir" 2>/dev/null || true
-        mask=$(read_mask)
-
-        # Validate the complete three-theme set before changing any mount. If a
-        # bind later fails, remove every CFW bind so all themes expose their
-        # stock SquashFS files instead of leaving a mixed partial selection.
-        [ -r "$variants/theme1/$mask.view" ] || exit 0
-        [ -r "$variants/theme2/$mask.view" ] || exit 0
-        [ -r "$variants/midi-theme1/$mask.view" ] || exit 0
-        bind_variant "$variants/theme1/$mask.view" \
-            /usr/resource/layout/theme1/launcher/hiby_launcher_apps.view || {
-                unmount_variants
-                exit 0
-            }
-        bind_variant "$variants/theme2/$mask.view" \
-            /usr/resource/layout/theme2/launcher/hiby_launcher_apps.view || {
-                unmount_variants
-                exit 0
-            }
-        bind_variant "$variants/midi-theme1/$mask.view" \
-            /usr/resource/layout/midi/theme1/launcher/hiby_launcher_apps.view || {
-                unmount_variants
-                exit 0
-            }
+        # Fail open: a rejected optional theme must never prevent normal boot.
+        apply_transaction || {
+            unmount_all
+            exit 0
+        }
         ;;
     stop)
-        unmount_variants
+        unmount_all
         ;;
     *)
         echo "Usage: $0 {start|stop|reload|restart}" >&2
