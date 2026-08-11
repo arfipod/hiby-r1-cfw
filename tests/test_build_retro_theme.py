@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-import importlib.util
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
-
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "tools" / "build_retro_theme.py"
-SPEC = importlib.util.spec_from_file_location("build_retro_theme", MODULE_PATH)
-assert SPEC and SPEC.loader
-retro = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = retro
-SPEC.loader.exec_module(retro)
+TOOLS = ROOT / "tools"
+sys.path.insert(0, str(TOOLS))
+
+import retro_theme_assets as assets
+import retro_theme_common as retro
+import retro_theme_package as package
 
 
 class RetroThemeGeneratorTests(unittest.TestCase):
@@ -33,8 +30,8 @@ class RetroThemeGeneratorTests(unittest.TestCase):
         self.assertNotEqual(first.getpixel((0, 0)), first.getpixel((4, 4)))
 
     def test_toggle_states_have_same_geometry_but_different_pixels(self) -> None:
-        enabled = retro.make_toggle((36, 36), True)
-        disabled = retro.make_toggle((36, 36), False)
+        enabled = assets.make_toggle((36, 36), True)
+        disabled = assets.make_toggle((36, 36), False)
         self.assertEqual(enabled.size, disabled.size)
         self.assertNotEqual(enabled.tobytes(), disabled.tobytes())
 
@@ -80,8 +77,8 @@ class RetroThemeGeneratorTests(unittest.TestCase):
             (source / "b.bin").write_bytes(b"\x00\x01\x02")
             first = root / "first.zip"
             second = root / "second.zip"
-            first_hash = retro.deterministic_zip(source, first)
-            second_hash = retro.deterministic_zip(source, second)
+            first_hash = package.deterministic_zip(source, first)
+            second_hash = package.deterministic_zip(source, second)
             self.assertEqual(first_hash, second_hash)
             self.assertEqual(first.read_bytes(), second.read_bytes())
 
