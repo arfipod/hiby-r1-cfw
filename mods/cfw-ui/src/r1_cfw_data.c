@@ -68,7 +68,7 @@ void r1_cfw_paths_init(struct r1_cfw_paths *paths) {
     copy_environment(paths->internal_path, sizeof(paths->internal_path),
                      "R1_CFW_INTERNAL_PATH", "/usr/data");
     copy_environment(paths->sd_path, sizeof(paths->sd_path),
-                     "R1_CFW_SD_PATH", "/data/mnt/sd_0");
+                     "R1_CFW_SD_PATH", "/usr/data/mnt/sd_0");
     copy_environment(paths->ssh_control, sizeof(paths->ssh_control),
                      "R1_CFW_SSH_CONTROL", "/usr/bin/r1-ssh-control");
 }

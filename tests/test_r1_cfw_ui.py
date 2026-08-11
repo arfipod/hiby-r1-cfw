@@ -126,6 +126,35 @@ class R1CFWUITests(unittest.TestCase):
             "R1_CFW_TEST_SSH_STATE": str(ssh_state),
         }
 
+    def test_physical_microsd_default_matches_the_stock_mountpoint(self) -> None:
+        source = (SOURCE_DIR / "r1_cfw_data.c").read_text(encoding="utf-8")
+        self.assertIn(
+            '"R1_CFW_SD_PATH", "/usr/data/mnt/sd_0"',
+            source,
+        )
+        self.assertNotIn(
+            '"R1_CFW_SD_PATH", "/data/mnt/sd_0"',
+            source,
+        )
+
+    def test_numeric_glyphs_are_upright(self) -> None:
+        source = (SOURCE_DIR / "r1_cfw_platform.c").read_text(encoding="utf-8")
+        expected = (
+            "{'0',{0x3e,0x51,0x49,0x45,0x3e}}",
+            "{'1',{0x00,0x42,0x7f,0x40,0x00}}",
+            "{'2',{0x42,0x61,0x51,0x49,0x46}}",
+            "{'3',{0x21,0x41,0x45,0x4b,0x31}}",
+            "{'4',{0x18,0x14,0x12,0x7f,0x10}}",
+            "{'5',{0x27,0x45,0x45,0x45,0x39}}",
+            "{'6',{0x3c,0x4a,0x49,0x49,0x30}}",
+            "{'7',{0x01,0x71,0x09,0x05,0x03}}",
+            "{'8',{0x36,0x49,0x49,0x49,0x36}}",
+            "{'9',{0x06,0x49,0x49,0x29,0x1e}}",
+        )
+        for glyph in expected:
+            with self.subTest(glyph=glyph[:4]):
+                self.assertIn(glyph, source)
+
     def test_launcher_masks_use_the_canonical_recoverable_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
