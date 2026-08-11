@@ -1,0 +1,22 @@
+{
+  "border": "#97938B",
+  "canvas": "#F0EEE7",
+  "coral": "#EE474F",
+  "coral_soft": "#F4B3B6",
+  "cyan": "#02AAEB",
+  "cyan_soft": "#B8E6F4",
+  "disabled": "#CACACA",
+  "frame": "#FFFFFF",
+  "header": "#494949",
+  "header_dot": "#686868",
+  "ink": "#171A1A",
+  "mint": "#20D898",
+  "mint_soft": "#B5E8D0",
+  "muted": "#777777",
+  "surface": "#E5E2DA",
+  "surface_bright": "#FAF8F2",
+  "violet": "#9A70F0",
+  "violet_soft": "#D8CAF2",
+  "yellow": "#FECA40",
+  "yellow_soft": "#F7DEA0"
+}
