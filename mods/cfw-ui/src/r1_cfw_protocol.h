@@ -17,6 +17,7 @@ enum r1_cfw_screen_id {
     R1_CFW_SCREEN_MEMORY = 5,
     R1_CFW_SCREEN_SYSTEM = 6,
     R1_CFW_SCREEN_ABOUT = 7,
+    R1_CFW_SCREEN_APPEARANCE = 8,
 };
 
 enum r1_cfw_action_id {
@@ -29,6 +30,8 @@ enum r1_cfw_action_id {
     R1_CFW_ACTION_LAUNCHER_TOGGLE = 6,
     R1_CFW_ACTION_LAUNCHER_REJECTED = 7,
     R1_CFW_ACTION_DRAG_IGNORED = 8,
+    R1_CFW_ACTION_THEME_SET = 9,
+    R1_CFW_ACTION_THEME_REJECTED = 10,
 };
 
 /* Emulator-only state record written to R1_CFW_TEST_STATE_PATH. All fields
