@@ -1,17 +1,53 @@
 # Retro Handheld theme
 
-## Goal
+## Overview
 
-Retro Handheld is a reversible third visual theme for the HiBy R1. It combines
-portable-console, PDA, homebrew, and early-2000s embedded-UI cues with modern
-legibility. It is not a firmware image and it does not modify the kernel,
-recovery system, bootloader, MTD layout, or updater.
+Retro Handheld is a reversible third visual theme for the HiBy R1 CFW. It
+combines portable-console, PDA, homebrew, and early-2000s embedded-UI cues with
+modern legibility. The repository stores only deterministic transformation code
+and original primitives; generated vendor-derived resources remain local.
 
-## Generator
+The CFW Appearance page exposes four choices:
 
-`tools/build_retro_theme.py` takes a locally extracted stock light-theme tree and
-creates a complete `retro/` resource tree. The build is deterministic: identical
-inputs produce a byte-identical ZIP.
+- **System default**: preserve the stock firmware's own Light/Dark selection;
+- **Light**: force the stock light resources;
+- **Dark**: force the stock dark resources;
+- **Retro Handheld**: activate the generated Retro resource tree.
+
+The canonical persistent state is:
+
+```text
+/usr/data/r1-cfw/theme.conf
+```
+
+with exactly one of:
+
+```text
+theme=stock
+theme=light
+theme=dark
+theme=retro
+```
+
+State is written atomically. Missing or malformed state falls back to `stock`.
+The independent CFW sidecar previews Retro immediately; stock-player resources
+apply after the next normal player/userland restart.
+
+## Generation
+
+For a standalone importable package, provide locally extracted themes shaped as:
+
+```text
+hiby-r1-themes/
+├── light/
+│   ├── layout/
+│   └── litegui/
+└── dark/
+    ├── layout/
+    └── litegui/
+```
+
+Then run:
 
 ```bash
 python3 tools/build_retro_theme.py \
@@ -20,66 +56,62 @@ python3 tools/build_retro_theme.py \
   --zip work/retro-handheld-theme.zip
 ```
 
-The source root must contain `light/layout` and `light/litegui`. The generator:
-
-1. copies the complete light-theme structure;
-2. maps stock cold-blue colors to the Retro Handheld token palette;
-3. creates original launcher cards and pixel-style launcher/CFW icons;
-4. injects a dotted charcoal top-bar background;
-5. rebuilds common cards, toggles, slider tracks, player controls, and navigation
-   affordances;
-6. preserves QR codes, certificates, boot animation, and screensavers;
-7. verifies that every stock file remains present and every PNG keeps its original
-   geometry;
-8. writes hashes, previews, and a deterministic ZIP.
-
-## Expected output
+The firmware release pipeline performs the same generation directly from the
+independently extracted stock 1.6 rootfs. It installs only the resulting
+`retro/layout` and `retro/litegui` tree below:
 
 ```text
-retro-handheld-theme/
-├── retro/
-│   ├── layout/
-│   └── litegui/
-├── previews/
-├── manifest.json
-├── palette.json
-└── README.md
+/usr/resource/r1-cfw/themes/retro
 ```
 
-The `retro/` subtree is suitable as the input to a future theme installer or
-bind-mount selector. It also includes `launcher/cfw.png`, `cfw_s.png`, and CFW
-card assets for integration with the existing generated launcher.
-
-## Repository integration
-
-The safe integration model should be:
+It then generates all 41 supported Retro launcher masks under:
 
 ```text
-user-selected theme state in /usr/data/r1-cfw
-  -> validate complete generated Retro resource set
-  -> bind-mount Retro layout/litegui paths before hiby_player starts
-  -> remove all Retro binds on any partial failure
-  -> expose the stock selected theme as the fallback
+/usr/resource/r1-cfw/launcher/retro
 ```
 
-Do not copy a partial set. Theme application should be atomic from the player's
-point of view and should require only a normal player/userland restart.
+## Runtime application
 
-The launcher generator should consume the original `cfw` and `tile_cfw` assets
-from the generated Retro pack when producing Retro launcher masks. Existing tile
-names, callback mappings, touch rectangles, and mask rules must remain unchanged.
+`S90r1-cfw` applies theme and launcher mounts as one fail-open transaction before
+`hiby_player` starts. It validates every required source and selected launcher
+variant before mounting anything. A partial mount failure unwinds all launcher
+file mounts first and all parent theme directory mounts second, exposing the
+stock SquashFS resources.
+
+Light and Dark reuse the stock resource trees. Retro is mounted over both stock
+theme slots, so it remains active regardless of the vendor theme index. MIDI
+keeps its stock resource tree and its independently generated launcher variant.
+
+## Validation
+
+The build pipeline:
+
+1. regenerates Retro from the patched stock resource tree;
+2. installs the complete generated tree;
+3. generates every safe Retro launcher mask;
+4. packs and independently re-extracts the candidate SquashFS;
+5. regenerates Retro again from the independently extracted candidate stock
+   resources;
+6. byte-compares all files, modes, directories, and symlinks;
+7. verifies every Retro launcher variant and original asset geometry;
+8. includes every generated path in the strict rootfs allowlist;
+9. enforces the existing main-rootfs partition ceiling and release evidence
+   gate.
+
+Unit tests also cover canonical theme persistence, malformed-state recovery,
+Appearance navigation, immediate Retro sidecar rendering, stock/light/dark/retro
+mount plans, incomplete-theme fallback, wide/narrow launcher cards, and release
+pipeline wiring.
 
 ## Known limitation
 
-The stock UI font remains the vendor font. The shared font directory is global,
-contains multilingual coverage, and is not safely replaceable as a theme-local
-asset. This limitation does not apply to the independent CFW sidecar, which can
-use its own embedded bitmap font.
+The shared vendor font remains unchanged. It is global and multilingual rather
+than theme-local. Replacing it only for Retro would require a riskier global font
+change. The independent CFW sidecar continues to use its embedded bitmap font.
 
-## Validation boundary
+## Safety boundary
 
-Host validation can prove deterministic output, resource completeness, PNG
-geometry, static layout parsing, QEMU rendering, and safe fallback behavior. It
-cannot prove physical LCD color response, touch feel, DAC, Wi-Fi, Bluetooth,
-NAND, recovery, or updater behavior. Building this theme must never flash a
-physical player.
+Theme generation and validation never flash a physical player, write MTD,
+modify the kernel, recovery system, or bootloader, or invoke the device updater.
+QEMU/static validation does not prove physical LCD response, touch feel, DAC,
+Wi-Fi, Bluetooth, NAND, or recovery behavior.
