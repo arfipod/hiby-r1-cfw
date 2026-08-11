@@ -9,6 +9,7 @@
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,6 +54,18 @@ struct touch_ownership {
     int descriptor;
     int stock_descriptor;
     int grabbed;
+};
+
+/* Linux getdents64 is used only in the post-fork child.  libc directory
+ * helpers allocate memory and may take locks that belonged to another player
+ * thread at fork time, while a blind close(3..OPEN_MAX) sweep can spend many
+ * seconds under qemu-user. */
+struct r1_linux_dirent64 {
+    uint64_t inode;
+    int64_t offset;
+    uint16_t record_length;
+    uint8_t type;
+    char name[];
 };
 
 typedef int (*stock_callback_t)(void *, void *);
@@ -205,6 +218,54 @@ static int duplicate_for_exec(int descriptor) {
         return -saved_errno;
     }
     return duplicate;
+}
+
+static int descriptor_from_name(const char *name) {
+    unsigned value = 0;
+    const unsigned char *cursor = (const unsigned char *)name;
+    if (!cursor || *cursor < '0' || *cursor > '9') return -1;
+    do {
+        unsigned digit = (unsigned)(*cursor - '0');
+        if (value > ((unsigned)INT32_MAX - digit) / 10U) return -1;
+        value = value * 10U + digit;
+        ++cursor;
+    } while (*cursor >= '0' && *cursor <= '9');
+    if (*cursor != '\0') return -1;
+    return (int)value;
+}
+
+/* Run after fork using raw syscalls and a stack buffer only.  The parent opens
+ * the directory before fork, so this path cannot allocate, resolve symbols,
+ * or acquire process-local locks inherited from another player thread. */
+static int child_close_unneeded_descriptors(int directory_descriptor,
+                                            int framebuffer, int touch) {
+    _Alignas(uint64_t) unsigned char buffer[4096];
+    for (;;) {
+        long bytes = syscall(SYS_getdents64, directory_descriptor, buffer,
+                             sizeof(buffer));
+        size_t position = 0;
+        if (bytes == 0) break;
+        if (bytes < 0) return -errno;
+        while (position < (size_t)bytes) {
+            struct r1_linux_dirent64 *entry =
+                (struct r1_linux_dirent64 *)(void *)(buffer + position);
+            size_t minimum = offsetof(struct r1_linux_dirent64, name) + 1U;
+            int descriptor;
+            if (entry->record_length < minimum ||
+                entry->record_length > (size_t)bytes - position) {
+                return -EIO;
+            }
+            descriptor = descriptor_from_name(entry->name);
+            if (descriptor > STDERR_FILENO &&
+                descriptor != directory_descriptor &&
+                descriptor != framebuffer && descriptor != touch) {
+                (void)syscall(SYS_close, descriptor);
+            }
+            position += entry->record_length;
+        }
+    }
+    (void)syscall(SYS_close, directory_descriptor);
+    return 0;
 }
 
 /* If stock already owns EVIOCGRAB, transfer it to a fresh queue and retain a
@@ -401,7 +462,7 @@ static int launch_ui(int framebuffer, int touch) {
     const char *emulator_framebuffer_path;
     const char *emulator_exec_wrapper = NULL;
     const char *executable = R1_UI_APPLICATION;
-    long descriptor_limit = sysconf(_SC_OPEN_MAX);
+    int descriptor_directory = -1;
     size_t environment_count = 0;
     size_t environment_index;
     size_t child_environment_index = 0;
@@ -463,32 +524,33 @@ static int launch_ui(int framebuffer, int touch) {
         arguments[5] = NULL;
     }
 
+    descriptor_directory = open("/proc/self/fd",
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor_directory < 0) {
+        int saved_errno = errno;
+        free(child_environment);
+        return -saved_errno;
+    }
     child = fork();
     if (child < 0) {
         int saved_errno = errno;
+        close(descriptor_directory);
         free(child_environment);
         return -saved_errno;
     }
     if (child == 0) {
         (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
         if (getppid() == 1) _exit(126);
-        /* sysconf is avoided after fork: it may acquire libc locks inherited
-         * from another player thread. */
-        if (descriptor_limit < 0 || descriptor_limit > 65536)
-            descriptor_limit = 65536;
-        {
-            int descriptor;
-            for (descriptor = 3; descriptor < descriptor_limit; ++descriptor) {
-                if (descriptor != framebuffer && descriptor != touch)
-                    close(descriptor);
-            }
-        }
+        if (child_close_unneeded_descriptors(descriptor_directory, framebuffer,
+                                             touch) < 0)
+            _exit(126);
         if (child_environment)
             execve(executable, arguments, child_environment);
         else
             execv(R1_UI_APPLICATION, arguments);
         _exit(127);
     }
+    close(descriptor_directory);
     do {
         waited = waitpid(child, &status, 0);
     } while (waited < 0 && errno == EINTR);

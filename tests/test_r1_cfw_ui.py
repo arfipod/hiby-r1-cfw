@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import stat
@@ -133,9 +134,9 @@ class R1CFWUITests(unittest.TestCase):
             valid_masks = [
                 mask
                 for mask in range(0x80)
-                if mask & 0x20 and 4 <= mask.bit_count() <= 7
+                if mask & 0x20 and 4 <= mask.bit_count() <= 6
             ]
-            self.assertEqual(42, len(valid_masks))
+            self.assertEqual(41, len(valid_masks))
             for mask in valid_masks:
                 (data / "launcher.conf").write_text(
                     f"launcher_mask={mask:02x}\n", encoding="ascii"
@@ -146,15 +147,30 @@ class R1CFWUITests(unittest.TestCase):
 
             for malformed in (
                 "launcher_mask=7F\n",
+                "launcher_mask=7f\n",
                 "launcher_mask=0x71\n",
                 "launcher_mask=70\n",
                 "launcher_mask=20\n",
                 "mask=71\n",
                 "launcher_mask=gg\n",
+                "launcher_mask=71",
+                "launcher_mask=71\nlauncher_mask=73\n",
+                "",
             ):
                 (data / "launcher.conf").write_text(malformed, encoding="ascii")
                 result = self.run_data(base, "--launcher-show")
+                self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual("launcher_mask=71\n", result.stdout, malformed)
+                self.assertEqual(
+                    "launcher_mask=71\n",
+                    (data / "launcher.conf").read_text(encoding="ascii"),
+                    malformed,
+                )
+                self.assertEqual(
+                    0o600,
+                    stat.S_IMODE((data / "launcher.conf").stat().st_mode),
+                    malformed,
+                )
 
     def test_launcher_toggles_lock_cfw_and_keep_at_least_four_tiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -174,6 +190,57 @@ class R1CFWUITests(unittest.TestCase):
             disabled = self.run_data(base, "--launcher-set", "stream", "0")
             self.assertEqual(0, disabled.returncode, disabled.stderr)
             self.assertEqual("launcher_mask=71\n", disabled.stdout)
+
+    def test_seventh_tile_is_rejected_and_each_optional_tile_is_restorable(self) -> None:
+        entries = (
+            ("music", 0x01),
+            ("stream", 0x02),
+            ("wireless", 0x04),
+            ("ebook", 0x08),
+            ("system", 0x10),
+            ("about", 0x40),
+        )
+        message = "Maximum 6 launcher tiles. Disable one first.\n"
+        for name, bit in entries:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    data = base / "data"
+                    data.mkdir()
+                    initial_mask = 0x7F & ~bit
+                    config = data / "launcher.conf"
+                    config.write_text(
+                        f"launcher_mask={initial_mask:02x}\n", encoding="ascii"
+                    )
+
+                    blocked = self.run_data(base, "--launcher-set", name, "1")
+                    self.assertNotEqual(0, blocked.returncode)
+                    self.assertEqual("", blocked.stdout)
+                    self.assertEqual(message, blocked.stderr)
+                    self.assertEqual(
+                        f"launcher_mask={initial_mask:02x}\n",
+                        config.read_text(encoding="ascii"),
+                    )
+
+                    donor_name, donor_bit = next(
+                        (candidate_name, candidate_bit)
+                        for candidate_name, candidate_bit in entries
+                        if candidate_bit != bit and initial_mask & candidate_bit
+                    )
+                    reduced = self.run_data(
+                        base, "--launcher-set", donor_name, "0"
+                    )
+                    self.assertEqual(0, reduced.returncode, reduced.stderr)
+                    restored = self.run_data(base, "--launcher-set", name, "1")
+                    self.assertEqual(0, restored.returncode, restored.stderr)
+                    expected_mask = 0x7F & ~donor_bit
+                    self.assertEqual(
+                        f"launcher_mask={expected_mask:02x}\n", restored.stdout
+                    )
+                    self.assertEqual(
+                        f"launcher_mask={expected_mask:02x}\n",
+                        config.read_text(encoding="ascii"),
+                    )
 
     def test_collectors_report_storage_memory_ssh_and_wifi_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -239,6 +306,44 @@ class R1CFWUITests(unittest.TestCase):
             self.assertEqual("60", degraded_fields["memory_available_kib"])
             self.assertEqual("40", degraded_fields["memory_used_kib"])
 
+    def test_qemu_controller_wrapper_uses_the_target_shell_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            wrapper = base / "qemu-wrapper"
+            wrapper_log = base / "qemu-wrapper.log"
+            wrapper.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/sh
+                    printf '%s\\n' "$@" >> "$R1_CFW_TEST_WRAPPER_LOG"
+                    exec "$@"
+                    """
+                ),
+                encoding="ascii",
+            )
+            wrapper.chmod(0o755)
+            result = self.run_data(
+                base,
+                "--dump-info",
+                R1_QEMU_EXEC_WRAPPER=str(wrapper),
+                R1_CFW_TEST_WRAPPER_LOG=str(wrapper_log),
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(
+                [
+                    "/bin/sh",
+                    str(base / "r1-ssh-control"),
+                    "is-enabled",
+                ],
+                wrapper_log.read_text(encoding="ascii").splitlines(),
+            )
+            fields = dict(
+                line.split("=", 1)
+                for line in result.stdout.splitlines()
+                if "=" in line
+            )
+            self.assertEqual("1", fields["ssh_enabled"])
+
     def start_ui(
         self,
         base: Path,
@@ -247,6 +352,7 @@ class R1CFWUITests(unittest.TestCase):
         bpp: int = 16,
         framebuffer_bytes: int = 1_536_000,
         packed: bool = False,
+        touch_fd_minimum: int | None = None,
         extra_environment: dict[str, str] | None = None,
     ) -> tuple[subprocess.Popen[bytes], int, Path, Path]:
         framebuffer = base / "framebuffer.raw"
@@ -254,6 +360,12 @@ class R1CFWUITests(unittest.TestCase):
             stream.truncate(framebuffer_bytes)
         framebuffer_fd = os.open(framebuffer, os.O_RDWR)
         touch_read, touch_write = os.pipe()
+        if touch_fd_minimum is not None:
+            inherited_touch = fcntl.fcntl(
+                touch_read, fcntl.F_DUPFD, touch_fd_minimum
+            )
+            os.close(touch_read)
+            touch_read = inherited_touch
         state_path = base / "cfw-state.bin"
         environment = os.environ.copy()
         environment.update(self.data_environment(base))
@@ -286,6 +398,55 @@ class R1CFWUITests(unittest.TestCase):
         os.close(framebuffer_fd)
         os.close(touch_read)
         return process, touch_write, state_path, framebuffer
+
+    def test_inherited_touch_descriptor_above_fd_setsize(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            process, touch, state_path, _ = self.start_ui(
+                Path(temporary),
+                touch_fd_minimum=2048,
+                extra_environment={"R1_CFW_TEST_AUTO_EXIT_MS": "80"},
+            )
+            os.close(touch)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(0, process.returncode, (stdout, stderr))
+            record = self.read_state(state_path)
+            self.assertGreaterEqual(record[2], 2)
+
+    def test_invalid_inherited_touch_descriptor_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            framebuffer = base / "framebuffer.raw"
+            with framebuffer.open("wb") as stream:
+                stream.truncate(1_536_000)
+            framebuffer_fd = os.open(framebuffer, os.O_RDWR)
+            environment = os.environ.copy()
+            environment.update(self.data_environment(base))
+            process = subprocess.Popen(
+                [
+                    str(self.host_binary),
+                    "--fb-fd",
+                    str(framebuffer_fd),
+                    "--touch-fd",
+                    "9999",
+                    "--test-mode",
+                    "--fb-stride",
+                    "960",
+                    "--fb-bpp",
+                    "16",
+                    "--fb-bytes",
+                    "1536000",
+                ],
+                pass_fds=(framebuffer_fd,),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            os.close(framebuffer_fd)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(5, process.returncode, (stdout, stderr))
+            self.assertEqual(
+                b"invalid inherited touch descriptor\n", stderr
+            )
 
     def read_state(
         self,
@@ -426,6 +587,58 @@ class R1CFWUITests(unittest.TestCase):
                     record = self.read_state(state_path)
                     self.assertEqual(action, record[5])
                     self.assertEqual(route, record[6])
+
+    def test_touch_launcher_limit_recovers_after_disabling_one_tile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            data = base / "data"
+            data.mkdir()
+            config = data / "launcher.conf"
+            config.write_text("launcher_mask=7b\n", encoding="ascii")
+            process, touch, state_path, _ = self.start_ui(base)
+            initial = self.read_state(state_path)
+            self.assertEqual((1, 0x7B), (initial[3], initial[4]))
+
+            self.send_touch(touch, 200, 332)  # Launcher row.
+            launcher = self.read_state(
+                state_path,
+                lambda state: state[3] == 2 and state[2] > initial[2],
+            )
+            self.send_touch(touch, 200, 260)  # Seventh tile: Wireless.
+            rejected = self.read_state(
+                state_path,
+                lambda state: state[3] == 2
+                and state[4] == 0x7B
+                and state[5] == 7
+                and state[2] > launcher[2],
+            )
+            self.assertEqual("launcher_mask=7b\n", config.read_text(encoding="ascii"))
+
+            self.send_touch(touch, 200, 188)  # Disable Stream first.
+            reduced = self.read_state(
+                state_path,
+                lambda state: state[4] == 0x79
+                and state[5] == 6
+                and state[2] > rejected[2],
+            )
+            self.send_touch(touch, 200, 260)  # Wireless is now restorable.
+            restored = self.read_state(
+                state_path,
+                lambda state: state[4] == 0x7D
+                and state[5] == 6
+                and state[2] > reduced[2],
+            )
+            self.assertEqual("launcher_mask=7d\n", config.read_text(encoding="ascii"))
+
+            self.send_touch(touch, 40, 30)  # Subpage Back.
+            self.read_state(
+                state_path,
+                lambda state: state[3] == 1 and state[2] > restored[2],
+            )
+            self.send_touch(touch, 40, 30)  # Root Back exits.
+            os.close(touch)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(0, process.returncode, (stdout, stderr))
 
     def test_target_build_produces_only_the_two_root_artifacts(self) -> None:
         zig = REPO_ROOT / "work/host-tools/zig-x86_64-linux-0.16.0/zig"
@@ -616,6 +829,13 @@ class R1CFWUITests(unittest.TestCase):
 
         ui_source = (SOURCE_DIR / "r1_cfw_ui.c").read_text(encoding="utf-8")
         self.assertIn('"APPLIES ON NEXT PLAYER RESTART"', ui_source)
+        self.assertIn(
+            '"Maximum 6 launcher tiles. Disable one first."',
+            (SOURCE_DIR / "r1_cfw_data.h").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "ui->launcher_notice = R1_CFW_LAUNCHER_LIMIT_MESSAGE", ui_source
+        )
 
 
 if __name__ == "__main__":

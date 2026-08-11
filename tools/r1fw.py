@@ -548,8 +548,15 @@ def command_extract_rootfs(args: argparse.Namespace) -> None:
     if destination.exists():
         shutil.rmtree(destination)
     unsquashfs = find_program(args.unsquashfs, "unsquashfs")
+    # unsquashfs applies its inherited umask while recreating inode modes.  The
+    # extracted tree is an editable firmware image, so masking (for example)
+    # stock 0775/0664 entries to 0755/0644 silently changes the rebuilt rootfs.
+    # Clear the mask in the child only; the caller's umask still governs every
+    # file that r1fw itself creates.
     subprocess.run(
-        [unsquashfs, "-d", str(destination), str(args.rootfs.resolve())], check=True
+        [unsquashfs, "-d", str(destination), str(args.rootfs.resolve())],
+        check=True,
+        umask=0,
     )
 
 

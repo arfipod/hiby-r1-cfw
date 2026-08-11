@@ -44,6 +44,7 @@
 #define R1_DEFAULT_STATE_PATH "/tmp/r1-qemu-frame-state"
 #define R1_DEFAULT_TOUCH_PATH "/tmp/r1-qemu-touch.fifo"
 #define R1_INHERITED_FRAMEBUFFER_FD_ENV "R1_QEMU_INHERITED_FB_FD"
+#define R1_MAX_FRAMEBUFFER_FDS 16U
 #define R1_MAX_INPUT_FDS 16U
 #define R1_FRAME_STATE_MAGIC 0x52314642U
 #define R1_CRASH_STATE_MAGIC 0x52314352U
@@ -78,18 +79,30 @@ struct r1_input_event_log {
 _Static_assert(sizeof(struct r1_dma_descriptor) == 16,
                "unexpected R1 DMA descriptor size");
 
-static int framebuffer_fd = -1;
+/* Every /dev/fb0 open needs emulated ioctls, but only the player's first live
+ * descriptor owns the DMA destination mapping. The CFW hook opens and mmaps an
+ * auxiliary descriptor for snapshot/restore; treating that open as the DMA
+ * owner would leave a dangling pointer when the snapshot mapping is unmapped. */
+static int primary_framebuffer_fd = -1;
+static int framebuffer_fds[R1_MAX_FRAMEBUFFER_FDS];
 static int hgl_dma_fd = -1;
 static int frame_state_fd = -1;
 static int input_log_fd = -1;
 static int input_event_log_fd = -1;
 static int crash_log_fd = -1;
 static int input_fds[R1_MAX_INPUT_FDS];
+/* Real evdev EVIOCGRAB selects one open file description and suppresses event
+ * delivery to every other client.  Each shim open has its own host FIFO, so
+ * bridge.py must broadcast first and the player process enforces the grab when
+ * it reads.  The CFW sidecar inherits the owner's FIFO descriptor and reads it
+ * directly after exec; it does not need this process-local bookkeeping. */
+static int input_grab_fd = -1;
+static int input_grab_lock;
 static unsigned input_open_serial;
 static uint32_t current_yoffset;
 static uint32_t frame_sequence;
-static uint8_t *framebuffer_mapping;
-static size_t framebuffer_mapping_length;
+static uint8_t *primary_framebuffer_mapping;
+static size_t primary_framebuffer_mapping_length;
 static uint8_t *hgl_dma_mapping;
 static size_t hgl_dma_mapping_length;
 static signal_handler_t downstream_sigbus = SIG_DFL;
@@ -109,6 +122,17 @@ static ssize_t (*next_pwrite)(int, const void *, size_t, off_t);
 static int (*next_mkfifo)(const char *, mode_t);
 static signal_handler_t (*next_signal)(int, signal_handler_t);
 static int (*next_sigaction)(int, const struct sigaction *, struct sigaction *);
+
+static void lock_input_grab(void)
+{
+    while (__sync_lock_test_and_set(&input_grab_lock, 1))
+        ;
+}
+
+static void unlock_input_grab(void)
+{
+    __sync_lock_release(&input_grab_lock);
+}
 
 static void resolve_symbols(void)
 {
@@ -269,6 +293,58 @@ static int install_segv_diagnostic(void)
     return next_sigaction(SIGSEGV, &action, NULL);
 }
 
+static int is_framebuffer_fd(int fd)
+{
+    unsigned index;
+    if (fd < 0)
+        return 0;
+    for (index = 0; index < R1_MAX_FRAMEBUFFER_FDS; ++index) {
+        if (__sync_fetch_and_add(&framebuffer_fds[index], 0) == fd + 1)
+            return 1;
+    }
+    return 0;
+}
+
+static int register_framebuffer_fd(int fd)
+{
+    unsigned index;
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    for (index = 0; index < R1_MAX_FRAMEBUFFER_FDS; ++index) {
+        if (__sync_bool_compare_and_swap(&framebuffer_fds[index], 0, fd + 1)) {
+            (void)__sync_bool_compare_and_swap(&primary_framebuffer_fd, -1, fd);
+            return 0;
+        }
+    }
+    errno = EMFILE;
+    return -1;
+}
+
+static int record_framebuffer_open(int result)
+{
+    int saved_errno;
+    if (result < 0)
+        return result;
+    if (register_framebuffer_fd(result) == 0)
+        return result;
+    saved_errno = errno;
+    next_close(result);
+    errno = saved_errno;
+    return -1;
+}
+
+static void forget_framebuffer_fd(int fd)
+{
+    unsigned index;
+    for (index = 0; index < R1_MAX_FRAMEBUFFER_FDS; ++index) {
+        if (__sync_bool_compare_and_swap(&framebuffer_fds[index], fd + 1, 0))
+            break;
+    }
+    (void)__sync_bool_compare_and_swap(&primary_framebuffer_fd, fd, -1);
+}
+
 static int register_inherited_framebuffer(void)
 {
     const char *text = getenv(R1_INHERITED_FRAMEBUFFER_FD_ENV);
@@ -293,7 +369,8 @@ static int register_inherited_framebuffer(void)
     if (fcntl((int)value, F_GETFD) < 0)
         return -1;
 
-    framebuffer_fd = (int)value;
+    if (register_framebuffer_fd((int)value) != 0)
+        return -1;
     /* The handoff is one-shot.  Do not leak a now process-local descriptor
      * number into unrelated helpers later launched by the sidecar. */
     if (unsetenv(R1_INHERITED_FRAMEBUFFER_FD_ENV) != 0)
@@ -381,9 +458,7 @@ static int open_framebuffer_backing(void)
         errno = saved_errno;
         return -1;
     }
-    if (result >= 0)
-        framebuffer_fd = result;
-    return result;
+    return record_framebuffer_open(result);
 }
 
 static int is_event_name(const char *path)
@@ -396,6 +471,8 @@ static int is_event_name(const char *path)
 static int is_input_fd(int fd)
 {
     unsigned index;
+    if (fd < 0)
+        return 0;
     for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
         /* Store fd+1 so the zero-initialized array can represent an empty
          * slot.  Atomic loads avoid racing concurrent LiteGUI/input opens. */
@@ -410,10 +487,14 @@ static int record_input_open(const char *path, int result)
     unsigned index;
     if (result < 0 || !is_event_name(path))
         return result;
+    lock_input_grab();
     for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
-        if (__sync_bool_compare_and_swap(&input_fds[index], 0, result + 1))
+        if (__sync_bool_compare_and_swap(&input_fds[index], 0, result + 1)) {
+            unlock_input_grab();
             return result;
+        }
     }
+    unlock_input_grab();
     next_close(result);
     errno = EMFILE;
     return -1;
@@ -445,7 +526,7 @@ static int open_input_backing(void)
 static int record_open(const char *path, int result)
 {
     if (result >= 0 && path && strcmp(path, "/dev/fb0") == 0)
-        framebuffer_fd = result;
+        return record_framebuffer_open(result);
     if (result >= 0 && is_event_name(path))
         return record_input_open(path, result);
     return result;
@@ -614,14 +695,17 @@ int close(int fd)
 {
     unsigned index;
     resolve_symbols();
-    if (fd == framebuffer_fd)
-        framebuffer_fd = -1;
+    if (is_framebuffer_fd(fd))
+        forget_framebuffer_fd(fd);
     if (fd == hgl_dma_fd)
         hgl_dma_fd = -1;
+    lock_input_grab();
     for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
         if (__sync_bool_compare_and_swap(&input_fds[index], fd + 1, 0))
             break;
     }
+    (void)__sync_bool_compare_and_swap(&input_grab_fd, fd, -1);
+    unlock_input_grab();
     return next_close(fd);
 }
 
@@ -629,9 +713,9 @@ static void remember_mapping(int fd, void *result, size_t length)
 {
     if (result == MAP_FAILED)
         return;
-    if (fd == framebuffer_fd) {
-        framebuffer_mapping = result;
-        framebuffer_mapping_length = length;
+    if (fd == primary_framebuffer_fd) {
+        primary_framebuffer_mapping = result;
+        primary_framebuffer_mapping_length = length;
     } else if (fd == hgl_dma_fd) {
         hgl_dma_mapping = result;
         hgl_dma_mapping_length = length;
@@ -664,16 +748,18 @@ static int copy_dma_rows(const struct r1_dma_descriptor *descriptor)
     int64_t destination =
         (uint32_t)(descriptor->destination_physical - R1_FAKE_SMEM_START);
     unsigned row;
-    if (!framebuffer_mapping || !hgl_dma_mapping || !descriptor->line_bytes ||
+    if (!primary_framebuffer_mapping || !hgl_dma_mapping ||
+        !descriptor->line_bytes ||
         !descriptor->rows)
         return -1;
     for (row = 0; row < descriptor->rows; ++row) {
         if (source < 0 || destination < 0 ||
             (uint64_t)source + descriptor->line_bytes > hgl_dma_mapping_length ||
             (uint64_t)destination + descriptor->line_bytes >
-                framebuffer_mapping_length)
+                primary_framebuffer_mapping_length)
             return -1;
-        memcpy(framebuffer_mapping + destination, hgl_dma_mapping + source,
+        memcpy(primary_framebuffer_mapping + destination,
+               hgl_dma_mapping + source,
                descriptor->line_bytes);
         source += descriptor->source_stride;
         destination += descriptor->destination_stride;
@@ -705,8 +791,22 @@ ssize_t read(int fd, void *buffer, size_t count)
     ssize_t result;
     size_t payload_size;
     resolve_symbols();
+    if (!is_input_fd(fd))
+        return next_read(fd, buffer, count);
+    lock_input_grab();
     result = next_read(fd, buffer, count);
-    if (!is_input_fd(fd) || input_event_log_fd < 0)
+    /* A non-owner must consume its broadcast FIFO bytes while a grab is live,
+     * then hide them from the proprietary parser.  Returning EAGAIN without
+     * the read would replay sidecar gestures into stock after the grab ends. */
+    {
+        int owner = input_grab_fd;
+        if (owner >= 0 && owner != fd) {
+            errno = EAGAIN;
+            result = -1;
+        }
+    }
+    unlock_input_grab();
+    if (input_event_log_fd < 0)
         return result;
     memset(&record, 0, sizeof(record));
     record.magic = R1_INPUT_EVENT_MAGIC;
@@ -765,7 +865,22 @@ static void set_capability(void *argument, unsigned size, unsigned bit)
         bytes[bit / 8U] |= (uint8_t)(1U << (bit % 8U));
 }
 
-static int input_ioctl(unsigned long request, void *argument)
+static void flush_input_queues(void)
+{
+    uint8_t discarded[256];
+    unsigned index;
+    for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
+        int encoded = __sync_fetch_and_add(&input_fds[index], 0);
+        int fd;
+        if (!encoded)
+            continue;
+        fd = encoded - 1;
+        while (next_read(fd, discarded, sizeof(discarded)) > 0)
+            ;
+    }
+}
+
+static int input_ioctl(int fd, unsigned long request, void *argument)
 {
     uint32_t log_record[3];
     unsigned number = _IOC_NR(request);
@@ -855,7 +970,39 @@ static int input_ioctl(unsigned long request, void *argument)
             absolute->maximum = 255;
         return 0;
     }
-    if (number == _IOC_NR(EVIOCGRAB) || number == _IOC_NR(EVIOCSCLOCKID))
+    if (number == _IOC_NR(EVIOCGRAB)) {
+        int requested = (uintptr_t)argument != 0U;
+        int owner;
+        lock_input_grab();
+        owner = input_grab_fd;
+        if (requested) {
+            if (owner == fd || owner < 0) {
+                input_grab_fd = fd;
+                unlock_input_grab();
+                return 0;
+            }
+            unlock_input_grab();
+            errno = EBUSY;
+            return -1;
+        }
+        if (owner == fd) {
+            /* launch_ui has reaped the sidecar before the hook releases its
+             * descriptor, so no legitimate owner input remains.  Drain every
+            * broadcast endpoint before stock delivery resumes. */
+            flush_input_queues();
+            input_grab_fd = -1;
+            unlock_input_grab();
+            return 0;
+        }
+        if (owner < 0) {
+            unlock_input_grab();
+            return 0;
+        }
+        unlock_input_grab();
+        errno = EINVAL;
+        return -1;
+    }
+    if (number == _IOC_NR(EVIOCSCLOCKID))
         return 0;
     errno = ENOTTY;
     return -1;
@@ -885,8 +1032,8 @@ int ioctl(int fd, unsigned long request, ...)
 
     resolve_symbols();
     if (is_input_fd(fd))
-        return input_ioctl(request, argument);
-    if (fd != framebuffer_fd)
+        return input_ioctl(fd, request, argument);
+    if (!is_framebuffer_fd(fd))
         return next_ioctl(fd, request, argument);
     switch (request) {
     case FBIOGET_FSCREENINFO:

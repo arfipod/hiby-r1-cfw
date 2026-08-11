@@ -39,6 +39,29 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
             self.script.index('mv -f "$publish_tmp" "$output"'),
         )
 
+    def test_verification_and_publish_use_one_workspace_owned_candidate(self) -> None:
+        verify_start = self.script.index("verify_candidate()")
+        prepare_start = self.script.index("prepare_candidate()")
+        verify = self.script[verify_start:prepare_start]
+        self.assertIn('cp "$candidate" "$staged_tmp"', verify)
+        self.assertIn('mv -f "$staged_tmp" "$verified_candidate"', verify)
+        self.assertIn('unpack "$verified_candidate"', verify)
+        self.assertNotIn('unpack "$candidate"', verify)
+        self.assertLess(
+            verify.index('candidate_upt_sha256=$(sha256sum "$verified_candidate"'),
+            verify.index('unpack "$verified_candidate"'),
+        )
+        self.assertIn(
+            'if [ "$verified_upt_sha256" != "$candidate_upt_sha256" ]',
+            verify,
+        )
+
+        publish_start = self.script.index("publish_candidate()")
+        publish_end = self.script.index('\ncase "$mode" in', publish_start)
+        publish = self.script[publish_start:publish_end]
+        self.assertIn('cp "$verified_candidate" "$publish_tmp"', publish)
+        self.assertNotIn('cp "$candidate" "$publish_tmp"', publish)
+
     def test_workspace_lock_fails_fast_before_candidate_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary) / "locked-work"
@@ -96,7 +119,7 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
         start = self.script.index("verify_candidate()")
         finish = self.script.index("prepare_candidate()")
         verify = self.script[start:finish]
-        unpack = verify.index('unpack "$candidate"')
+        unpack = verify.index('unpack "$verified_candidate"')
         extract = verify.index('"$check_dir/images/rootfs.squashfs" "$check_root"')
         self.assertLess(unpack, extract)
         self.assertIn('cmp "$stock_unpack/images/xImage" "$check_dir/images/xImage"', verify)
@@ -121,8 +144,9 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
         self.assertIsNotNone(masks_match)
         assert masks_match is not None
         masks = masks_match.group("body").split()
-        self.assertEqual(42, len(masks))
-        self.assertEqual(42, len(set(masks)))
+        self.assertEqual(41, len(masks))
+        self.assertEqual(41, len(set(masks)))
+        self.assertNotIn("7f", masks)
         self.assertIn(
             '--expect-added "usr/resource/r1-cfw/launcher/$theme/$mask.view"',
             self.script,
@@ -137,9 +161,11 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
         finish = self.script.index('\ncase "$mode" in', start)
         publish = self.script[start:finish]
         gate = publish.index('verify_cfw_validation.py"')
-        copy = publish.index('cp "$candidate" "$publish_tmp"')
+        candidate_image = publish.index('"$check_dir/images/rootfs.squashfs"')
+        copy = publish.index('cp "$verified_candidate" "$publish_tmp"')
         rename = publish.index('mv -f "$publish_tmp" "$output"')
-        self.assertLess(gate, copy)
+        self.assertLess(gate, candidate_image)
+        self.assertLess(candidate_image, copy)
         self.assertLess(copy, rename)
         self.assertNotIn('--ximage "$stock_unpack/images/xImage"', publish)
 

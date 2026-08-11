@@ -58,6 +58,11 @@ class R1QemuRunnerPlanTests(unittest.TestCase):
             "R1_CFW_TEST_STATE_PATH=/tmp/r1-ui-run/cfw-state.bin",
             self.script,
         )
+        self.assertIn(
+            "R1_QEMU_EXEC_WRAPPER=/tmp/r1-host-qemu",
+            self.script,
+        )
+        self.assertIn("QEMU_LD_PREFIX=/", self.script)
         self.assertIn('"$runtime/hgl-dma.raw" "$runtime/cfw-state.bin"', self.script)
 
     def test_forced_sidecar_crash_control_is_validated_and_guest_scoped(self) -> None:
@@ -71,10 +76,21 @@ class R1QemuRunnerPlanTests(unittest.TestCase):
     def test_root_backend_uses_bwrap_without_weakening_network_isolation(self) -> None:
         self.assertIn("root_backend=${R1_QEMU_ROOT_BACKEND:-auto}", self.script)
         self.assertIn("auto|proot|bwrap)", self.script)
+        self.assertIn(
+            "binfmt_helper=$repo_dir/tools/r1-qemu-ssh/binfmt-bwrap.sh",
+            self.script,
+        )
         self.assertIn('--bind "$rootfs" /', self.script)
         self.assertIn('--ro-bind "$qemu" /tmp/r1-host-qemu', self.script)
+        self.assertIn('-b "$qemu:/tmp/r1-host-qemu"', self.script)
         self.assertIn(
-            'unshare --user --net --map-root-user "$@"',
+            "unshare --user --mount --net --map-root-user \\\n"
+            '                "$binfmt_helper" "$qemu" "$@"',
+            self.script,
+        )
+        self.assertIn(
+            "unshare --user --mount --map-root-user \\\n"
+            '                "$binfmt_helper" "$qemu" "$@"',
             self.script,
         )
         self.assertIn('run_player_bwrap "$1"', self.script)

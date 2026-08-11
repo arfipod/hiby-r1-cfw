@@ -19,6 +19,10 @@ enum r1_cfw_launcher_bit {
 
 #define R1_CFW_LAUNCHER_ALL 0x7fU
 #define R1_CFW_LAUNCHER_DEFAULT 0x71U
+#define R1_CFW_LAUNCHER_MIN_TILES 4U
+#define R1_CFW_LAUNCHER_MAX_TILES 6U
+#define R1_CFW_LAUNCHER_LIMIT_MESSAGE \
+    "Maximum 6 launcher tiles. Disable one first."
 
 struct r1_cfw_paths {
     char proc_root[256];

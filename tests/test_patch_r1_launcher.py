@@ -82,11 +82,24 @@ class R1LauncherTests(unittest.TestCase):
             {theme.output_name: theme.stock_sha256 for theme in launcher.THEMES},
         )
         self.assertEqual(0x71, launcher.DEFAULT_MASK)
-        self.assertEqual(42, len(launcher.SAFE_MASKS))
+        self.assertEqual(41, len(launcher.SAFE_MASKS))
         self.assertEqual(len(launcher.SAFE_MASKS), len(set(launcher.SAFE_MASKS)))
+        self.assertNotIn(launcher.ALL_TILE_BITS, launcher.SAFE_MASKS)
         for mask in launcher.SAFE_MASKS:
             self.assertTrue(mask & launcher.CFW_BIT)
-            self.assertIn(mask.bit_count(), range(4, 8))
+            self.assertIn(mask.bit_count(), range(4, 7))
+
+        six_tile_masks = [mask for mask in launcher.SAFE_MASKS if mask.bit_count() == 6]
+        optional_bits = {tile.bit for tile in launcher.TILES if tile.bit != launcher.CFW_BIT}
+        self.assertEqual(6, len(six_tile_masks))
+        self.assertEqual(
+            optional_bits,
+            {launcher.ALL_TILE_BITS ^ mask for mask in six_tile_masks},
+        )
+        for tile in launcher.TILES:
+            self.assertTrue(any(mask & tile.bit for mask in launcher.SAFE_MASKS))
+            if tile.bit != launcher.CFW_BIT:
+                self.assertTrue(any(not mask & tile.bit for mask in launcher.SAFE_MASKS))
 
     def test_generate_is_deterministic_and_preserves_stock_layouts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -98,7 +111,7 @@ class R1LauncherTests(unittest.TestCase):
             }
             with mock.patch.object(launcher, "THEMES", test_themes):
                 changed = launcher.generate_rootfs(root)
-                self.assertEqual(126 + 6 + len(launcher.LANGUAGES), len(changed))
+                self.assertEqual(123 + 6 + len(launcher.LANGUAGES), len(changed))
                 first_snapshot = {
                     path.relative_to(root): path.read_bytes()
                     for path in root.rglob("*")
@@ -126,9 +139,10 @@ class R1LauncherTests(unittest.TestCase):
                     ).iterdir()
                 }
                 self.assertIn("3f.view", generated_names)
-                self.assertIn("7f.view", generated_names)
+                self.assertIn("7e.view", generated_names)
+                self.assertNotIn("7f.view", generated_names)
                 self.assertNotIn("3F.view", generated_names)
-                self.assertNotIn("7F.view", generated_names)
+                self.assertNotIn("7E.view", generated_names)
 
             for relative, original in stock_before.items():
                 self.assertEqual(original, (root / relative).read_bytes())
@@ -169,7 +183,7 @@ class R1LauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(750, root.properties["h"])
                 self.assertEqual(50, root.properties["scroll_min_y"])
-                self.assertEqual("v_scroll", root.properties["flag"])
+                self.assertEqual("scroll", root.properties["flag"])
                 step = actual_groups[2]
                 self.assertEqual("launcher_apps_vg_step", step.name)
                 self.assertEqual("launcher_apps_iv_step", step.children[0].name)
@@ -184,37 +198,53 @@ class R1LauncherTests(unittest.TestCase):
                 self.assertEqual("launcher.ini", step.children[1].properties["ini"])
                 self.assertEqual("cfw", step.children[1].properties["text"])
 
-    def test_five_six_and_all_tile_layouts_are_compact_and_scroll_safely(self) -> None:
-        cases = {
-            0x73: (5, 738, 50),
-            0x77: (6, 738, 50),
-            0x7F: (7, 984, -184),
-        }
+    def test_all_safe_layouts_use_direct_nonoverflow_topology(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
-            for mask, (count, content_height, scroll_min_y) in cases.items():
+            for mask in launcher.SAFE_MASKS:
+                expected_tiles = launcher.selected_tiles(mask)
+                expected_geometry, content_height = launcher._tile_geometry(
+                    len(expected_tiles)
+                )
                 for theme in launcher.THEMES:
                     path = base / f"{theme.output_name}-{mask:02X}.view"
-                    path.write_bytes(launcher.render_layout(mask, theme))
+                    rendered = launcher.render_layout(mask, theme)
+                    self.assertEqual(rendered, launcher.render_layout(mask, theme))
+                    path.write_bytes(rendered)
                     root = parse_layout(path)
                     actual_groups = groups(root)
-                    self.assertEqual(count, len(actual_groups))
-                    for index, group in enumerate(actual_groups):
-                        self.assertEqual((index % 2) * 240, group.properties["x"])
-                        self.assertEqual((index // 2) * 246, group.properties["y"])
-                        self.assertEqual(240, group.properties["w"])
-                        self.assertEqual(246, group.properties["h"])
+                    self.assertEqual("vg_launcher_apps_hiby", root.name)
+                    self.assertEqual(
+                        [tile.group_name for tile in expected_tiles],
+                        [group.name for group in actual_groups],
+                    )
+                    self.assertEqual(
+                        expected_geometry,
+                        tuple(
+                            tuple(group.properties[key] for key in ("x", "y", "w", "h"))
+                            for group in actual_groups
+                        ),
+                    )
                     self.assertEqual(content_height, root.properties["h"])
+                    self.assertLessEqual(content_height, 750)
+                    if len(expected_tiles) in (5, 6):
+                        self.assertEqual(3 * 246, content_height)
+                    self.assertEqual(750, root.properties["hglview_h"])
                     self.assertEqual(50, root.properties["scroll_max_y"])
-                    self.assertEqual(scroll_min_y, root.properties["scroll_min_y"])
+                    self.assertEqual(50, root.properties["scroll_min_y"])
                     self.assertEqual(0, root.properties["scroll_max_x"])
                     self.assertEqual(0, root.properties["scroll_min_x"])
-                    self.assertEqual("v_scroll", root.properties["flag"])
+                    self.assertEqual("scroll", root.properties["flag"])
+                    for key in ("content_x", "content_y", "content_w", "content_h"):
+                        self.assertNotIn(key, root.properties)
 
-        all_names = [tile.group_name for tile in launcher.TILES]
-        rendered = launcher.render_layout(0x7F, launcher.THEMES[0]).decode("utf-8")
-        for name in all_names:
-            self.assertEqual(1, rendered.count(f'"name":"{name}"'))
+                    text = rendered.decode("utf-8")
+                    for tile in launcher.TILES:
+                        expected_count = 1 if mask & tile.bit else 0
+                        self.assertEqual(
+                            expected_count,
+                            text.count(f'"name":"{tile.group_name}"'),
+                        )
 
     def test_invalid_stock_or_string_fails_before_writing_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -284,7 +314,7 @@ class R1LauncherTests(unittest.TestCase):
                     launcher.verify_rootfs(root)
 
     def test_mask_validation_and_config_recovery(self) -> None:
-        for mask in (0x00, 0x20, 0x70, 0x51, 0xFF):
+        for mask in (0x00, 0x20, 0x70, 0x51, 0x7F, 0xFF):
             with self.assertRaises(launcher.LauncherError):
                 launcher.validate_mask(mask)
         for mask in launcher.SAFE_MASKS:
@@ -295,16 +325,17 @@ class R1LauncherTests(unittest.TestCase):
             missing = base / "missing.conf"
             self.assertEqual(0x71, launcher.select_config(missing))
             valid = base / "launcher.conf"
-            valid.write_text("# persisted by r1-cfw-ui\nlauncher_mask=0x7f\n", encoding="utf-8")
-            self.assertEqual(0x7F, launcher.select_config(valid))
+            valid.write_text("# persisted by r1-cfw-ui\nlauncher_mask=0x7e\n", encoding="utf-8")
+            self.assertEqual(0x7E, launcher.select_config(valid))
             valid.write_text("73\n", encoding="utf-8")
             self.assertEqual(0x73, launcher.select_config(valid))
             for invalid in (
                 "launcher_mask=20\n",
                 "launcher_mask=70\n",
+                "launcher_mask=7F\n",
                 "launcher_mask=GG\n",
                 "unknown=7F\n",
-                "launcher_mask=73\nlauncher_mask=7F\n",
+                "launcher_mask=73\nlauncher_mask=7E\n",
             ):
                 valid.write_text(invalid, encoding="utf-8")
                 self.assertEqual(0x71, launcher.select_config(valid), invalid)
@@ -312,12 +343,12 @@ class R1LauncherTests(unittest.TestCase):
     def test_select_config_cli_prints_normalized_two_digit_mask(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "launcher.conf"
-            config.write_text("launcher_mask=7f\n", encoding="utf-8")
+            config.write_text("launcher_mask=7e\n", encoding="utf-8")
             stdout = io.StringIO()
             with mock.patch.object(sys, "argv", [str(MODULE_PATH), "select-config", str(config)]):
                 with contextlib.redirect_stdout(stdout):
                     launcher.main()
-            self.assertEqual("7f\n", stdout.getvalue())
+            self.assertEqual("7e\n", stdout.getvalue())
 
     def test_generated_icons_are_original_deterministic_theme_sized_pngs(self) -> None:
         expected = {
@@ -337,9 +368,12 @@ class R1LauncherTests(unittest.TestCase):
 
     def test_masks_and_variant_names_are_lowercase_hex(self) -> None:
         self.assertEqual("3f", launcher.mask_name(0x3F))
-        self.assertEqual("7f", launcher.mask_name(0x7F))
+        self.assertEqual("7e", launcher.mask_name(0x7E))
+        with self.assertRaises(launcher.LauncherError):
+            launcher.mask_name(0x7F)
         names = {f"{launcher.mask_name(mask)}.view" for mask in launcher.SAFE_MASKS}
-        self.assertEqual(42, len(names))
+        self.assertEqual(41, len(names))
+        self.assertNotIn("7f.view", names)
         for name in names:
             self.assertRegex(name, r"^[0-9a-f]{2}\.view$")
 

@@ -13,11 +13,12 @@ launcher_mask=71
 ```
 
 Bit 5 is the CFW tile and is mandatory, and every generated configuration has
-at least four visible tiles. Missing, malformed, or unsupported state falls
-back to `0x71` (stored as `71`: Music, System, CFW, About). The all-enabled
-`0x7f` configuration restores Stream, Wireless, and eBook and uses a vertically
-scrollable 984-pixel content surface. A selector failure leaves the stock
-six-tile launcher available.
+four through six visible tiles. Missing, malformed, legacy `0x7f`, or otherwise
+unsupported state falls back to `0x71` (stored as `71`: Music, System, CFW,
+About). Every optional stock tile can be restored after disabling another tile.
+Attempting a seventh reports `Maximum 6 launcher tiles. Disable one first.` and
+does not change the configuration. Proper all-seven scrolling is deferred to
+v0.2; a selector failure leaves the stock six-tile launcher available.
 
 `libr1-cfw-hook.so` is loaded only for `hiby_player`. It verifies the exact
 stock Step descriptor, callback pointer, and no-op instructions before changing
@@ -51,6 +52,7 @@ installed by `tools/build-cfw-0.1.sh`; they are not committed to Git.
 The firmware build has separate `prepare` and `publish` stages. `prepare`
 creates and independently verifies a candidate under `work/`. QEMU validation
 extracts and runs the hashed candidate SquashFS itself, then rehashes it before
-PASS. `publish` verifies the exact 23-check manifest and its featured PNG
+PASS. `publish` verifies the exact 24-check manifest and the canonical
+`default-compact-launcher.png`, `cfw-main.png`, and `six-tile-launcher.png`
 evidence before it atomically writes `dist/r1-cfw-0.1-experimental.upt`.
 Neither stage flashes a player, writes MTD, or modifies the stock input in place.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -23,14 +24,23 @@ class R1QEMUFramebufferHandoffSourceTests(unittest.TestCase):
         self.assertIn('getenv(R1_QEMU_FRAMEBUFFER_PATH_ENV)', hook)
         self.assertIn("execve(executable, arguments, child_environment)", hook)
         self.assertIn('"/tmp/r1-host-qemu"', hook)
+        self.assertIn('open("/proc/self/fd"', hook)
+        self.assertIn("syscall(SYS_getdents64", hook)
+        self.assertIn("syscall(SYS_close, descriptor)", hook)
+        self.assertNotIn("descriptor_limit", hook)
         self.assertNotIn("setenv(R1_QEMU_INHERITED_FB_FD_ENV", hook)
 
         self.assertIn('"R1_QEMU_INHERITED_FB_FD"', shim)
         self.assertIn("fcntl((int)value, F_GETFD)", shim)
-        self.assertIn("framebuffer_fd = (int)value", shim)
+        self.assertIn("register_framebuffer_fd((int)value)", shim)
+        self.assertIn("static int primary_framebuffer_fd = -1", shim)
         self.assertIn("unsetenv(R1_INHERITED_FRAMEBUFFER_FD_ENV)", shim)
         self.assertIn("int __open_2(const char *path, int flags)", shim)
         self.assertIn("int __open64_2(const char *path, int flags)", shim)
+        self.assertIn("static int input_grab_fd = -1", shim)
+        self.assertIn("owner >= 0 && owner != fd", shim)
+        self.assertIn("flush_input_queues();", shim)
+        self.assertIn("errno = EBUSY", shim)
 
 
 class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
@@ -50,10 +60,12 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
         cls.build = Path(cls.temporary.name)
         cls.shim = cls.build / "libr1-qemu-fbshim.so"
         cls.probe = cls.build / "fb-handoff-probe"
+        cls.input_grab_probe = cls.build / "input-grab-probe"
         cls.callback_hook = cls.build / "libr1-cfw-hook-test.so"
         cls.callback_probe = cls.build / "cfw-callback-probe"
         cls.sidecar = cls.build / "r1-cfw-ui"
         probe_source = cls.build / "fb-handoff-probe.c"
+        input_grab_probe_source = cls.build / "input-grab-probe.c"
         callback_probe_source = cls.build / "cfw-callback-probe.c"
         probe_source.write_text(
             textwrap.dedent(
@@ -107,21 +119,154 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
             ),
             encoding="ascii",
         )
+        input_grab_probe_source.write_text(
+            textwrap.dedent(
+                r"""
+                #include <errno.h>
+                #include <fcntl.h>
+                #include <linux/input.h>
+                #include <stdio.h>
+                #include <stdlib.h>
+                #include <sys/ioctl.h>
+                #include <unistd.h>
+
+                static int send_byte(const char *base, unsigned endpoint,
+                                     unsigned char value) {
+                    char path[512];
+                    int descriptor;
+                    int length = snprintf(path, sizeof(path), "%s.%u",
+                                          base, endpoint);
+                    if (length < 0 || (size_t)length >= sizeof(path)) return -1;
+                    descriptor = open(path, O_WRONLY | O_NONBLOCK);
+                    if (descriptor < 0) return -1;
+                    if (write(descriptor, &value, 1) != 1) {
+                        close(descriptor);
+                        return -1;
+                    }
+                    return close(descriptor);
+                }
+
+                static int expect_eagain(int descriptor) {
+                    unsigned char value = 0;
+                    ssize_t result;
+                    errno = 0;
+                    result = read(descriptor, &value, 1);
+                    if (result != -1 || errno != EAGAIN)
+                        dprintf(2, "fd=%d result=%ld errno=%d value=%u\n",
+                                descriptor, (long)result, errno, value);
+                    return result == -1 && errno == EAGAIN;
+                }
+
+                static int expect_byte(int descriptor, unsigned char expected) {
+                    unsigned char value = 0;
+                    return read(descriptor, &value, 1) == 1 && value == expected;
+                }
+
+                int main(void) {
+                    const char *base = getenv("R1_QEMU_TOUCH_PATH");
+                    int stock0 = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+                    int stock1 = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+                    int owner = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+                    unsigned endpoint;
+                    if (!base || stock0 < 0 || stock1 < 0 || owner < 0) return 10;
+                    if (ioctl(owner, EVIOCGRAB, 1) != 0) return 11;
+                    errno = 0;
+                    if (ioctl(stock0, EVIOCGRAB, 1) != -1 || errno != EBUSY)
+                        return 12;
+                    for (endpoint = 0; endpoint < 3; ++endpoint)
+                        if (send_byte(base, endpoint, 0x41) != 0) return 13;
+                    if (!expect_eagain(stock0)) return 141;
+                    if (!expect_eagain(stock1)) return 142;
+                    if (!expect_byte(owner, 0x41)) return 143;
+
+                    /* Leave one sidecar-era byte queued on every endpoint.
+                     * Releasing the grab must discard it before stock resumes. */
+                    for (endpoint = 0; endpoint < 3; ++endpoint)
+                        if (send_byte(base, endpoint, 0x42) != 0) return 15;
+                    if (ioctl(owner, EVIOCGRAB, 0) != 0) return 16;
+                    if (!expect_eagain(stock0) || !expect_eagain(stock1) ||
+                        !expect_eagain(owner)) return 17;
+
+                    for (endpoint = 0; endpoint < 3; ++endpoint)
+                        if (send_byte(base, endpoint, 0x43) != 0) return 18;
+                    if (!expect_byte(stock0, 0x43) ||
+                        !expect_byte(stock1, 0x43) ||
+                        !expect_byte(owner, 0x43)) return 19;
+                    close(owner);
+                    close(stock1);
+                    close(stock0);
+                    return 0;
+                }
+                """
+            ),
+            encoding="ascii",
+        )
         callback_probe_source.write_text(
             textwrap.dedent(
                 r"""
                 #define _GNU_SOURCE
                 #include <dlfcn.h>
+                #include <fcntl.h>
+                #include <stdint.h>
+                #include <string.h>
+                #include <sys/mman.h>
+                #include <unistd.h>
 
                 typedef int (*callback_t)(void);
 
+                struct r1_dma_descriptor {
+                    uint32_t source_offset;
+                    uint32_t destination_physical;
+                    int16_t source_stride;
+                    int16_t destination_stride;
+                    uint16_t line_bytes;
+                    uint16_t rows;
+                };
+
                 int main(void) {
+                    const size_t framebuffer_bytes = 480U * 800U * 4U * 2U;
+                    const size_t dma_bytes = 6U * 1024U * 1024U;
+                    struct r1_dma_descriptor transfer = {
+                        0U, 0x10000000U, 1920, 1920, 1920U, 1U
+                    };
                     callback_t callback =
                         (callback_t)dlsym(RTLD_DEFAULT,
                                           "r1_cfw_test_callback");
+                    unsigned char *framebuffer;
+                    unsigned char *dma;
+                    unsigned char preserved[1920];
+                    int framebuffer_fd;
+                    int dma_fd;
+                    unsigned lifecycle;
                     if (!callback) return 96;
-                    if (callback() != 0) return 97;
-                    if (callback() != 0) return 98;
+                    if (sysconf(_SC_OPEN_MAX) <= 65536L) return 107;
+                    framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+                    if (framebuffer_fd < 0) return 99;
+                    framebuffer = mmap(NULL, framebuffer_bytes,
+                                       PROT_READ | PROT_WRITE, MAP_SHARED,
+                                       framebuffer_fd, 0);
+                    if (framebuffer == MAP_FAILED) return 100;
+                    memcpy(preserved, framebuffer, sizeof(preserved));
+                    dma_fd = open("/dev/sa_hgl_dma", O_RDWR | O_CLOEXEC);
+                    if (dma_fd < 0) return 101;
+                    dma = mmap(NULL, dma_bytes, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, dma_fd, 0);
+                    if (dma == MAP_FAILED) return 102;
+                    memset(dma, 0xa5, transfer.line_bytes);
+                    for (lifecycle = 0; lifecycle < 8U; ++lifecycle)
+                        if (callback() != 0) return 97;
+                    if (memcmp(framebuffer, preserved, sizeof(preserved)) != 0)
+                        return 106;
+                    if (write(dma_fd, &transfer, sizeof(transfer)) !=
+                        (ssize_t)sizeof(transfer)) return 103;
+                    if (framebuffer[0] != 0xa5 ||
+                        framebuffer[transfer.line_bytes - 1U] != 0xa5)
+                        return 104;
+                    if (munmap(dma, dma_bytes) != 0 ||
+                        munmap(framebuffer, framebuffer_bytes) != 0)
+                        return 105;
+                    close(dma_fd);
+                    close(framebuffer_fd);
                     return 0;
                 }
                 """
@@ -160,6 +305,20 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
         )
         subprocess.run(
             [*target, str(probe_source), "-o", str(cls.probe)],
+            check=True,
+            cwd=REPO_ROOT,
+            env=cache_environment,
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                *target,
+                "-U_FORTIFY_SOURCE",
+                str(input_grab_probe_source),
+                "-o",
+                str(cls.input_grab_probe),
+            ],
             check=True,
             cwd=REPO_ROOT,
             env=cache_environment,
@@ -293,13 +452,32 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
         self.assertEqual(480 * 800 * 4 * 2, backing.stat().st_size)
         self.assertEqual(b"\x5a", backing.read_bytes()[:1])
 
+    def test_input_grab_filters_and_drains_broadcast_endpoints(self) -> None:
+        touch = self.build / "grab-touch"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LD_PRELOAD": str(self.shim),
+                "QEMU_CPU": "XBurstR2",
+                "R1_QEMU_TOUCH_PATH": str(touch),
+            }
+        )
+        result = subprocess.run(
+            [str(self.qemu), "-L", str(self.rootfs), str(self.input_grab_probe)],
+            check=False,
+            env=environment,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(0, result.returncode, (result.stdout, result.stderr))
+
     def test_malformed_or_closed_handoffs_fail_before_main(self) -> None:
         for malformed in ("", "+3", " 3", "3x", "2147483648", "12345"):
             with self.subTest(value=malformed):
                 result = self.run_probe(malformed, 0, "valid")
                 self.assertEqual(190, result.returncode, result.stderr)
 
-    def test_real_sidecar_exec_restores_the_framebuffer_twice(self) -> None:
+    def test_sidecar_restores_framebuffer_and_preserves_primary_dma_mapping(self) -> None:
         framebuffer = self.build / "callback-framebuffer.raw"
         original = bytes(range(251)) * ((480 * 800 * 4 * 2) // 251 + 1)
         original = original[: 480 * 800 * 4 * 2]
@@ -311,7 +489,9 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
             {
                 "LD_PRELOAD": f"{self.callback_hook}:{self.shim}",
                 "QEMU_CPU": "XBurstR2",
+                "QEMU_LD_PREFIX": str(self.rootfs),
                 "R1_QEMU_FB_PATH": str(framebuffer),
+                "R1_QEMU_EXEC_WRAPPER": str(self.qemu),
                 "R1_QEMU_TOUCH_PATH": str(touch),
                 "R1_QEMU_STATE_PATH": str(self.build / "callback-frame-state.bin"),
                 "R1_CFW_TEST_STATE_PATH": str(state),
@@ -339,7 +519,12 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, (result.stdout, result.stderr))
         self.assertTrue(state.is_file(), (result.stdout, result.stderr))
         self.assertEqual(28, state.stat().st_size)
-        self.assertEqual(original, framebuffer.read_bytes())
+        expected = bytearray(original)
+        expected[:1920] = b"\xa5" * 1920
+        self.assertEqual(bytes(expected), framebuffer.read_bytes())
+        for index in range(8):
+            endpoint = Path(f"{touch}.{index}")
+            self.assertTrue(stat.S_ISFIFO(endpoint.stat().st_mode), endpoint)
 
 
 if __name__ == "__main__":

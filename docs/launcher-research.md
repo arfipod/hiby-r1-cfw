@@ -70,7 +70,7 @@ avoided.
 
 ## 6. Launcher visibility architecture
 
-`tools/patch_r1_launcher.py` generates all 42 safe masks in all three themes.
+`tools/patch_r1_launcher.py` generates all 41 safe masks in all three themes.
 The mask bits are:
 
 ```text
@@ -78,29 +78,38 @@ The mask bits are:
 10 System   20 CFW       40 About
 ```
 
-A safe mask contains four through seven tiles and always includes CFW. The
-default `0x71` shows Music, System, CFW, and About. Persistent state is the
-single recoverable line `/usr/data/r1-cfw/launcher.conf` (stored without an
-`0x` prefix):
+A safe mask contains four through six tiles and always includes CFW. The
+default `0x71` shows Music, System, CFW, and About. Every optional stock tile is
+individually restorable after disabling another tile. Attempting to enable a
+seventh tile leaves the configuration unchanged and reports `Maximum 6 launcher
+tiles. Disable one first.` Persistent state is the single recoverable line
+`/usr/data/r1-cfw/launcher.conf` (stored without an `0x` prefix):
 
 ```text
 launcher_mask=71
 ```
 
 At boot, `S90r1-cfw` validates the value and bind-mounts the corresponding
-read-only, build-generated layout before `hiby_player` starts. Missing or
-invalid state falls back to `71`; any bind failure leaves the stock layout.
-Launcher changes take effect on the next userland restart because the stock
-player caches the parsed launcher object tree.
+read-only, build-generated layout before `hiby_player` starts. Missing,
+invalid, or legacy `7f` state falls back to `71`; the boot selector does not
+rewrite persistent state. The sidecar canonicalizes invalid state when it is
+next opened. Any bind failure leaves the stock layout. Launcher changes take
+effect on the next userland restart because the stock player caches the parsed
+launcher object tree.
 
-## 7. Scrolling architecture
+## 7. Bounded launcher geometry
 
 Four tiles use large custom rectangles within the 750-pixel viewport. Five and
-six tiles use 246-pixel two-column rows. The all-enabled `0x7f` mask produces
-984 pixels of content with `flag=v_scroll`, `scroll_max_y=50`, and
-`scroll_min_y=-184`. Stock HGL gesture handling retains large targets and
-suppresses click activation during a drag. Reopening the player rebuilds the
-view at its deterministic initial position.
+six tiles use 246-pixel two-column rows and a 738-pixel content surface. Every
+generated view keeps the tiles directly below `vg_launcher_apps_hiby`, uses the
+stock-compatible `flag=scroll` click behavior, and fixes both vertical scroll
+bounds at screen Y=50. No v0.1 layout exceeds the viewport, so reopening the
+player always starts at the same fixed position.
+
+A seven-tile scrolling layout was investigated but did not provide reliable
+stock HGL drag/click dispatch. With the user's approval, v0.1 rejects `0x7f`
+instead of shipping an unstable gesture path. Proper all-seven scrolling is an
+explicit v0.2 follow-up.
 
 ## 8. CFW UI architecture
 
@@ -135,15 +144,19 @@ callback. The preload is optional and fail-open at boot.
 
 The repository's qemu-user shim supplies the exact 480x800 double framebuffer,
 HGL DMA copies, and 16-byte MIPS input events. Static layout parsing covers all
-126 generated views. Candidate validation independently extracts and runs the
+123 generated views. Candidate validation independently extracts and runs the
 hashed SquashFS, then hashes it again before PASS. It writes its report and
 screenshots below ignored `artifacts/ui/cfw-v0.1/`; publication stays blocked
-until the complete 23-check PASS manifest and its verified 480x800 PNG evidence
-match the exact candidate rootfs. The mandatory matrix also forces one sidecar
-`SIGABRT` and requires the player, restored framebuffer, and a subsequent Music
-touch route to remain functional. QEMU does not emulate
-the X1600 board, Wi-Fi radio, Bluetooth controller, DAC, NAND, or recovery
-updater.
+until the complete 24-check PASS manifest and its verified 480x800 PNG evidence
+match the exact candidate rootfs.
+
+The launcher matrix covers the default `71` mask, six-tile `77`, rejection of a
+seventh tile without a state change, drag without activation, every visible
+six-tile route, an eBook-restoring swap to alternate six-tile `7d`, persistence,
+and deterministic restart position. The mandatory matrix also forces one
+sidecar `SIGABRT` and requires the player, restored framebuffer, and a
+subsequent Music touch route to remain functional. QEMU does not emulate the
+X1600 board, Wi-Fi radio, Bluetooth controller, DAC, NAND, or recovery updater.
 
 ## 13. Build validation
 
@@ -174,6 +187,7 @@ after producing a local file and does not flash a player or write an MTD device.
 4. Confirm Music, System, CFW, and About before changing launcher visibility.
 5. Open and close CFW three times; verify touch and the stock framebuffer return.
 6. Test SSH off/on, then Wi-Fi and Bluetooth navigation through CFW.
-7. Enable all tiles, restart userland normally, and test scroll, taps, and Back.
+7. Restore Stream, Wireless, and eBook individually while keeping at most six
+   tiles visible; restart userland and verify every resulting tile and Back.
 8. If boot or input fails, use the already-proven stock recovery path; never
    write MTD devices manually.

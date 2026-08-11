@@ -12,7 +12,7 @@ Tile masks are two-digit hexadecimal values with these stable bits::
     01 Music       02 Stream       04 Wireless      08 eBook
     10 System      20 CFW          40 About
 
-Safe masks contain four through seven tiles and always contain CFW.  The
+Safe masks contain four through six tiles and always contain CFW.  The
 default ``71`` mask selects Music, System, CFW, and About.
 """
 
@@ -191,7 +191,7 @@ THEMES = (
 SAFE_MASKS = tuple(
     mask
     for mask in range(ALL_TILE_BITS + 1)
-    if mask & CFW_BIT and 4 <= mask.bit_count() <= 7
+    if mask & CFW_BIT and 4 <= mask.bit_count() <= 6
 )
 
 CFW_STRING_LINE = "  <cfw>CFW</cfw>"
@@ -231,9 +231,9 @@ def validate_mask(mask: int) -> None:
     if not mask & CFW_BIT:
         raise LauncherError(f"launcher mask must keep CFW visible: {mask:02x}")
     count = mask.bit_count()
-    if count < 4 or count > 7:
+    if count < 4 or count > 6:
         raise LauncherError(
-            f"launcher mask must select four through seven tiles: {mask:02x}"
+            f"launcher mask must select four through six tiles: {mask:02x}"
         )
 
 
@@ -443,7 +443,6 @@ def render_layout(mask: int, theme: ThemeSpec) -> bytes:
             for index, y in enumerate(range(0, content_height, line_height))
         )
 
-    scroll_min_y = 50 - max(0, content_height - 750)
     properties: list[tuple[str, object]] = [
         ("name", "vg_launcher_apps_hiby"),
         ("type", "hgl_view"),
@@ -456,7 +455,7 @@ def render_layout(mask: int, theme: ThemeSpec) -> bytes:
         ("hglview_w", 480),
         ("hglview_h", 750),
         ("scroll_max_y", 50),
-        ("scroll_min_y", scroll_min_y),
+        ("scroll_min_y", 50),
         ("scroll_max_x", 0),
         ("scroll_min_x", 0),
     ]
@@ -464,7 +463,7 @@ def render_layout(mask: int, theme: ThemeSpec) -> bytes:
         properties.append(("color", theme.background))
     properties.extend(
         (
-            ("flag", "v_scroll"),
+            ("flag", "scroll"),
             ("zorder", -9),
             ("viewgroup", True),
             ("add_layout", True),

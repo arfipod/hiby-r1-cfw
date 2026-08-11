@@ -29,6 +29,7 @@ stock_upt_sha256=9aada81995d8d2b2ed80d6cf292c62bc5f0f705e51e4f69c7e766ee67536ba6
 rootfs_max_size=47185920
 work_dir=${R1_CFW_WORK_DIR:-$repo_dir/work/r1-cfw-0.1}
 candidate=${R1_CFW_CANDIDATE:-$work_dir/r1-cfw-0.1-experimental.candidate.upt}
+verified_candidate=$work_dir/verified-candidate.upt
 output=${R1_CFW_OUTPUT:-$repo_dir/dist/r1-cfw-0.1-experimental.upt}
 validation_manifest=${R1_CFW_VALIDATION_MANIFEST:-$repo_dir/artifacts/ui/cfw-v0.1/validation-manifest.json}
 stock_unpack=$work_dir/stock
@@ -143,7 +144,7 @@ ukrainian
     launcher_masks="
 27 2b 2d 2e 2f 33 35 36 37 39 3a 3b 3c 3d 3e 3f
 63 65 66 67 69 6a 6b 6c 6d 6e 6f 71 72 73 74 75
-76 77 78 79 7a 7b 7c 7d 7e 7f
+76 77 78 79 7a 7b 7c 7d 7e
 "
     for theme in theme1 theme2 midi-theme1; do
         for mask in $launcher_masks; do
@@ -190,6 +191,16 @@ verify_candidate() {
         exit 1
     fi
 
+    # Verify and later publish one workspace-owned snapshot. The source
+    # candidate may be outside the locked work directory, so reading it again
+    # after verification would permit a non-cooperating writer to substitute a
+    # different UPT while retaining evidence for the first one.
+    staged_tmp=$(mktemp "$work_dir/.verified-candidate.XXXXXX")
+    cp "$candidate" "$staged_tmp"
+    chmod 0644 "$staged_tmp"
+    mv -f "$staged_tmp" "$verified_candidate"
+    candidate_upt_sha256=$(sha256sum "$verified_candidate" | awk '{print $1}')
+
     # Rebuild from the current sources into an independent directory. This
     # prevents a candidate prepared before a source edit from passing publish.
     "$repo_dir/tools/build-r1-cfw-ui.sh" "$ui_verify_build"
@@ -197,7 +208,7 @@ verify_candidate() {
     python3 "$repo_dir/tools/r1fw.py" unpack "$firmware" "$stock_unpack" --force
     python3 "$repo_dir/tools/r1fw.py" extract-rootfs \
         "$stock_unpack/images/rootfs.squashfs" "$stock_root" --force
-    python3 "$repo_dir/tools/r1fw.py" unpack "$candidate" "$check_dir" --force
+    python3 "$repo_dir/tools/r1fw.py" unpack "$verified_candidate" "$check_dir" --force
 
     # The kernel and the candidate rootfs are checked as independent payloads.
     cmp "$stock_unpack/images/xImage" "$check_dir/images/xImage"
@@ -215,8 +226,12 @@ verify_candidate() {
     strict_rootfs_diff
 
     candidate_rootfs_sha256=$(sha256sum "$check_dir/images/rootfs.squashfs" | awk '{print $1}')
-    candidate_upt_sha256=$(sha256sum "$candidate" | awk '{print $1}')
-    echo "verified candidate: $candidate"
+    verified_upt_sha256=$(sha256sum "$verified_candidate" | awk '{print $1}')
+    if [ "$verified_upt_sha256" != "$candidate_upt_sha256" ]; then
+        echo "staged candidate changed during verification; refusing publication" >&2
+        exit 1
+    fi
+    echo "verified candidate snapshot: $verified_candidate"
     echo "candidate UPT sha256: $candidate_upt_sha256"
     echo "candidate rootfs sha256: $candidate_rootfs_sha256"
 }
@@ -263,7 +278,8 @@ prepare_candidate() {
 publish_candidate() {
     verify_candidate
     python3 "$repo_dir/tools/verify_cfw_validation.py" \
-        "$validation_manifest" "$candidate_rootfs_sha256"
+        "$validation_manifest" "$candidate_rootfs_sha256" \
+        "$check_dir/images/rootfs.squashfs"
 
     output_dir=$(dirname "$output")
     mkdir -p "$output_dir"
@@ -273,9 +289,9 @@ publish_candidate() {
         rm -f -- "$publish_tmp"
     }
     trap cleanup_publish_tmp EXIT HUP INT TERM
-    cp "$candidate" "$publish_tmp"
+    cp "$verified_candidate" "$publish_tmp"
     chmod 0644 "$publish_tmp"
-    cmp "$candidate" "$publish_tmp"
+    cmp "$verified_candidate" "$publish_tmp"
     published_upt_sha256=$(sha256sum "$publish_tmp" | awk '{print $1}')
     if [ "$published_upt_sha256" != "$candidate_upt_sha256" ]; then
         echo "candidate changed after verification; refusing publication" >&2

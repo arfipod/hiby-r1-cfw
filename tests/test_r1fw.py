@@ -189,6 +189,36 @@ class R1FirmwareUnitTests(unittest.TestCase):
                 Path("example"), (root / "usr/bin/example-link").readlink()
             )
 
+    def test_rootfs_extraction_clears_umask_in_unsquashfs_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            image = base / "rootfs.squashfs"
+            image.write_bytes(b"synthetic image")
+            unsquashfs = base / "unsquashfs"
+            unsquashfs.write_bytes(b"synthetic tool")
+            destination = base / "extracted"
+
+            with mock.patch.object(r1fw.subprocess, "run") as run:
+                r1fw.command_extract_rootfs(
+                    argparse.Namespace(
+                        output=destination,
+                        force=False,
+                        rootfs=image,
+                        unsquashfs=unsquashfs,
+                    )
+                )
+
+            run.assert_called_once_with(
+                [
+                    str(unsquashfs.resolve()),
+                    "-d",
+                    str(destination.resolve()),
+                    str(image.resolve()),
+                ],
+                check=True,
+                umask=0,
+            )
+
     def test_rootfs_diff_strict_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -222,6 +252,73 @@ class R1FirmwareUnitTests(unittest.TestCase):
     "firmware round-trip tools are not installed",
 )
 class R1FirmwareIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("unsquashfs"), "unsquashfs is not installed")
+    def test_rootfs_extraction_preserves_stock_modes_under_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            binary_directory = source / "usr/bin"
+            resource_directory = source / "usr/resource"
+            binary_directory.mkdir(parents=True)
+            resource_directory.mkdir(parents=True)
+            binary = binary_directory / "hiby_player"
+            translation = resource_directory / "launcher.ini"
+            binary.write_bytes(b"synthetic binary")
+            translation.write_bytes(b"synthetic translation")
+            source.chmod(0o775)
+            (source / "usr").chmod(0o775)
+            binary_directory.chmod(0o775)
+            resource_directory.chmod(0o775)
+            binary.chmod(0o775)
+            translation.chmod(0o664)
+
+            image = base / "rootfs.squashfs"
+            subprocess.run(
+                [
+                    "mksquashfs",
+                    str(source),
+                    str(image),
+                    "-noappend",
+                    "-comp",
+                    "lzo",
+                    "-all-root",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+
+            destination = base / "extracted"
+            previous_umask = os.umask(0o022)
+            try:
+                r1fw.command_extract_rootfs(
+                    argparse.Namespace(
+                        output=destination,
+                        force=False,
+                        rootfs=image,
+                        unsquashfs=None,
+                    )
+                )
+                parent_created = base / "parent-created"
+                descriptor = os.open(parent_created, os.O_CREAT | os.O_WRONLY, 0o666)
+                os.close(descriptor)
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(0o775, source.stat().st_mode & 0o777)
+            self.assertEqual(0o775, destination.stat().st_mode & 0o777)
+            self.assertEqual(0o775, (destination / "usr/bin").stat().st_mode & 0o777)
+            self.assertEqual(
+                0o775,
+                (destination / "usr/bin/hiby_player").stat().st_mode & 0o777,
+            )
+            self.assertEqual(
+                0o664,
+                (destination / "usr/resource/launcher.ini").stat().st_mode & 0o777,
+            )
+            self.assertEqual(0o644, parent_created.stat().st_mode & 0o777)
+
     def test_synthetic_firmware_pack_and_unpack(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

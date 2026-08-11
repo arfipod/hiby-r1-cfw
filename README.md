@@ -25,10 +25,11 @@ excluded from Git.
 - The real proprietary `hiby_player` reaches its 480×800 UI under qemu-user
   through emulator-only framebuffer, HGL DMA, evdev touch, alignment, SD, and
   `sys_server` adapters. A safe navigator records curated UI smoke artifacts.
-- CFW 0.1 uses 42 deterministic launcher configurations per stock theme, one
+- CFW 0.1 uses 41 deterministic launcher configurations per stock theme, one
   guarded runtime route, and an independent MIPS sidecar. The default `0x71`
-  mask shows Music, System, CFW, and About; `0x7f` restores every supported
-  stock and CFW tile with vertical scrolling.
+  mask shows Music, System, CFW, and About. CFW stays visible, four through six
+  tiles are supported, and every optional stock tile can be restored after
+  disabling another tile. Seven-tile scrolling is deferred to v0.2.
 - The CFW sidecar controls SSH through the existing controller, reports live
   storage/RAM/system data, persists launcher visibility, and routes Wi-Fi and
   Bluetooth to the preserved stock Wireless hub.
@@ -143,10 +144,30 @@ sha256sum dist/r1-cfw-0.1-experimental.upt
 ```
 
 Publication fails closed for missing, unsuccessful, malformed, or stale QEMU
-evidence. No final v0.1 UPT hash is documented before that gate succeeds. See
+evidence. The current gated local artifact passed all 24 mandatory checks:
+
+```text
+dist/r1-cfw-0.1-experimental.upt
+SHA-256: ebf38f188d666ab258b1805c2517df7f2bbdc67e753d017f877afffd419f5022
+```
+
+Its exact validated SquashFS SHA-256 is
+`4e070c5c6a78ece098179503b896da5ef098acc3616459a8c6062976377a3bb5`.
+Generated firmware remains untracked. See
 [cfw-guide.md](docs/cfw-guide.md) and
 [launcher-research.md](docs/launcher-research.md) for the architecture, exact
 launcher mapping, validation workflow, and remaining hardware-only risks.
+
+### QEMU UI gallery
+
+These are real 480×800 framebuffer captures from the exact candidate-bound
+24-check qemu-user PASS. They are emulator evidence only, not proof of behavior
+on physical hardware. CFW v0.1 supports four through six visible launcher
+tiles, deliberately has no launcher scrolling, and rejects a seventh tile.
+
+| Default compact launcher (`0x71`) | CFW main | Six-tile launcher (`0x77`) |
+| --- | --- | --- |
+| <img src="docs/images/cfw-v0.1/default-compact-launcher.png" alt="Default compact four-tile launcher in qemu-user" width="240"> | <img src="docs/images/cfw-v0.1/cfw-main.png" alt="CFW main screen in qemu-user" width="240"> | <img src="docs/images/cfw-v0.1/six-tile-launcher.png" alt="Maximum six-tile launcher in qemu-user" width="240"> |
 
 These commands only construct and validate local files. They do not flash a
 player, write an MTD device, alter the kernel/recovery image, or install the
@@ -173,8 +194,8 @@ python3 tools/r1-qemu-ui/bridge.py serve \
   --state work/gui-qemu/runtime/frame-state.bin
 ```
 
-If `test-audio.mp3` is present at the repository root, the runner copies it into
-the disposable simulated SD fixture. The curated navigator can review or run a
+If the ignored `misc/test-audio.mp3` fixture is present, the runner copies it
+into the disposable simulated SD. The curated navigator can review or run a
 non-destructive route through every launcher branch and that audio file:
 
 ```bash

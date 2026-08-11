@@ -22,6 +22,7 @@ qemu=$repo_dir/work/host-tools/qemu-user/usr/bin/qemu-mipsel
 proot=$repo_dir/work/host-tools/proot/usr/bin/proot
 proot_lib=$repo_dir/work/host-tools/proot/usr/lib/x86_64-linux-gnu
 bwrap=${R1_BWRAP:-$(command -v bwrap 2>/dev/null || true)}
+binfmt_helper=$repo_dir/tools/r1-qemu-ssh/binfmt-bwrap.sh
 unsquashfs=${R1_UNSQUASHFS:-$repo_dir/work/host-tools/usr/bin/unsquashfs}
 shim_dir=$repo_dir/work/gui-qemu/build
 input_nodes=$runtime/dev-input
@@ -101,7 +102,7 @@ set -- "$qemu"
 if [ "$root_backend" = proot ]; then
     set -- "$@" "$proot"
 else
-    set -- "$@" "$bwrap" "$(command -v unshare)"
+    set -- "$@" "$bwrap" "$(command -v unshare)" "$binfmt_helper"
 fi
 for required in "$@"; do
     if [ ! -e "$required" ]; then
@@ -151,12 +152,11 @@ fi
 mkdir -p "$rootfs/dev/input" "$rootfs/run" "$rootfs/tmp/r1-ui-lib" \
     "$rootfs/tmp/r1-ui-run"
 chmod 0755 "$rootfs/dev/input" "$rootfs/tmp/r1-ui-lib" "$rootfs/tmp/r1-ui-run"
-if [ "$root_backend" = bwrap ]; then
-    # File bind targets must exist before bubblewrap constructs the private
-    # mount namespace. This placeholder lives only in the disposable root.
-    : > "$rootfs/tmp/r1-host-qemu"
-    chmod 0755 "$rootfs/tmp/r1-host-qemu"
-fi
+# The emulator-only CFW hook re-executes a sidecar through qemu-user. Both
+# root backends bind the static host emulator here; the placeholder prevents
+# PRoot from leaving a mode-000 bind artifact after an interrupted session.
+: > "$rootfs/tmp/r1-host-qemu"
+chmod 0755 "$rootfs/tmp/r1-host-qemu"
 for device_name in null zero random urandom; do
     if [ ! -e "$rootfs/dev/$device_name" ]; then
         touch "$rootfs/dev/$device_name"
@@ -289,6 +289,11 @@ if [ -f "$rootfs/usr/lib/libr1-cfw-hook.so" ]; then
     guest_preload=/usr/lib/libr1-cfw-hook.so:$guest_preload
 fi
 guest_environment="LD_PRELOAD=$guest_preload"
+# These two values are consumed only when the in-process CFW hook launches a
+# second target ELF. The static wrapper is bound by both root backends, and `/`
+# is the guest root inside either namespace.
+guest_environment="$guest_environment,R1_QEMU_EXEC_WRAPPER=/tmp/r1-host-qemu"
+guest_environment="$guest_environment,QEMU_LD_PREFIX=/"
 guest_environment="$guest_environment,R1_QEMU_FB_PATH=/tmp/r1-ui-run/framebuffer.raw"
 guest_environment="$guest_environment,R1_QEMU_DMA_PATH=/tmp/r1-ui-run/hgl-dma.raw"
 guest_environment="$guest_environment,R1_QEMU_STATE_PATH=/tmp/r1-ui-run/frame-state.bin"
@@ -351,6 +356,7 @@ echo "    --state \"$runtime/frame-state.bin\""
 run_player_proot() {
     isolate_network=$1
     set -- "$proot" -0 -r "$rootfs" \
+        -b "$qemu:/tmp/r1-host-qemu" \
         -b "$shim_dir:/tmp/r1-ui-lib" \
         -b "$runtime:/tmp/r1-ui-run" \
         -b "$input_nodes:/dev/input" \
@@ -408,12 +414,14 @@ run_player_bwrap() {
         env \
             QEMU_CPU=XBurstR2 \
             QEMU_SET_ENV="$guest_environment" \
-            unshare --user --net --map-root-user "$@"
+            unshare --user --mount --net --map-root-user \
+                "$binfmt_helper" "$qemu" "$@"
     else
         env \
             QEMU_CPU=XBurstR2 \
             QEMU_SET_ENV="$guest_environment" \
-            unshare --user --map-root-user "$@"
+            unshare --user --mount --map-root-user \
+                "$binfmt_helper" "$qemu" "$@"
     fi
 }
 

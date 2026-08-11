@@ -6,12 +6,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,6 +52,7 @@ struct ui_state {
     int touch_fd;
     int redraw;
     const char *test_state_path;
+    const char *launcher_notice;
 };
 
 static volatile sig_atomic_t stop_requested;
@@ -169,7 +170,10 @@ static int run_data_command(const struct options *options,
         int result = r1_cfw_launcher_set(paths, options->launcher_name,
                                          options->launcher_enabled, &mask);
         if (result < 0) {
-            fprintf(stderr, "launcher update failed: %d\n", result);
+            if (result == -ENOSPC)
+                fprintf(stderr, "%s\n", R1_CFW_LAUNCHER_LIMIT_MESSAGE);
+            else
+                fprintf(stderr, "launcher update failed: %d\n", result);
             return 1;
         }
         printf("launcher_mask=%02x\n", mask);
@@ -299,8 +303,15 @@ static void draw_launcher(struct ui_state *ui, int page) {
     }
     r1_display_text(&ui->display, page, 22, 718,
                     "APPLIES ON NEXT PLAYER RESTART", 2, COLOR_ACCENT);
-    r1_display_text(&ui->display, page, 22, 748,
-                    "CFW LOCKED ON / MINIMUM 4 TILES", 2, COLOR_ACCENT);
+    if (ui->launcher_notice) {
+        int width = r1_display_text_width(ui->launcher_notice, 1);
+        r1_display_text(&ui->display, page,
+                        (R1_SCREEN_WIDTH - width) / 2, 752,
+                        ui->launcher_notice, 1, COLOR_ACCENT);
+    } else {
+        r1_display_text(&ui->display, page, 22, 748,
+                        "CFW LOCKED ON / 4 TO 6 TILES", 2, COLOR_ACCENT);
+    }
 }
 
 static void draw_storage(struct ui_state *ui, int page,
@@ -407,6 +418,7 @@ static void refresh_info(struct ui_state *ui) {
 static void go_to_page(struct ui_state *ui, enum r1_cfw_screen_id screen) {
     ui->screen = screen;
     ui->last_action = R1_CFW_ACTION_OPEN_PAGE;
+    ui->launcher_notice = NULL;
     refresh_info(ui);
     ui->redraw = 1;
 }
@@ -456,6 +468,7 @@ static void handle_launcher_tap(struct ui_state *ui, int row) {
     uint32_t mask;
     int result;
     if (row < 0 || row >= 7) return;
+    ui->launcher_notice = NULL;
     name = r1_cfw_launcher_name((unsigned)row);
     bit = r1_cfw_launcher_bit((unsigned)row);
     if (!name || bit == R1_CFW_TILE_CFW) {
@@ -467,6 +480,8 @@ static void handle_launcher_tap(struct ui_state *ui, int row) {
                                  !(ui->launcher_mask & bit), &mask);
     if (result < 0) {
         ui->last_action = R1_CFW_ACTION_LAUNCHER_REJECTED;
+        if (result == -ENOSPC)
+            ui->launcher_notice = R1_CFW_LAUNCHER_LIMIT_MESSAGE;
     } else {
         ui->launcher_mask = mask;
         ui->last_action = R1_CFW_ACTION_LAUNCHER_TOGGLE;
@@ -537,17 +552,27 @@ static int run_ui(const struct options *options,
                 fcntl(ui.touch_fd, F_GETFL) | O_NONBLOCK);
 
     while (!stop_requested) {
-        fd_set readers;
-        struct timeval timeout;
+        struct pollfd reader;
         struct r1_gesture gesture;
         int64_t now;
+        int poll_result;
         if (ui.redraw) render(&ui);
-        FD_ZERO(&readers);
-        FD_SET(ui.touch_fd, &readers);
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 20000;
-        (void)select(ui.touch_fd + 1, &readers, NULL, NULL, &timeout);
-        if (FD_ISSET(ui.touch_fd, &readers) &&
+        reader.fd = ui.touch_fd;
+        reader.events = POLLIN;
+        reader.revents = 0;
+        poll_result = poll(&reader, 1, 20);
+        if (poll_result < 0 && errno != EINTR) {
+            result = -errno;
+            fprintf(stderr, "touch poll failed: %d\n", result);
+            r1_display_destroy(&ui.display);
+            return 5;
+        }
+        if (poll_result > 0 && (reader.revents & POLLNVAL)) {
+            fprintf(stderr, "invalid inherited touch descriptor\n");
+            r1_display_destroy(&ui.display);
+            return 5;
+        }
+        if (poll_result > 0 && (reader.revents & (POLLIN | POLLHUP)) &&
             r1_touch_read(ui.touch_fd, &ui.touch, &gesture) > 0) {
             handle_gesture(&ui, &gesture);
         }

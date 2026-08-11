@@ -85,14 +85,11 @@ def touch_events(x: int, y: int, phase: str) -> bytes:
     x = max(0, min(WIDTH, int(x)))
     y = max(0, min(HEIGHT, int(y)))
     if phase == "up":
+        # Match the hardware-tested R1 injector exactly. The stock HGL input
+        # path commits release on BTN_TOUCH=0; a synthetic tracking-id teardown
+        # changes proprietary launcher gesture dispatch.
         return b"".join(
             (
-                input_event(EV_ABS, ABS_MT_TRACKING_ID, -1),
-                input_event(EV_ABS, ABS_MT_PRESSURE, 0),
-                input_event(EV_ABS, ABS_MT_TOUCH_MAJOR, 0),
-                input_event(EV_ABS, ABS_MT_POSITION_X, x),
-                input_event(EV_ABS, ABS_MT_POSITION_Y, y),
-                input_event(EV_SYN, SYN_MT_REPORT, 0),
                 input_event(EV_KEY, BTN_TOUCH, 0),
                 input_event(EV_SYN, SYN_MT_REPORT, 0),
                 input_event(EV_SYN, SYN_REPORT, 0),

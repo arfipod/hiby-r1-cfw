@@ -271,11 +271,18 @@ The seven visibility bits are:
 0x10 System     0x20 CFW         0x40 About
 ```
 
-All 42 safe masks retain CFW and at least four large tiles. They are generated
-for all three stock theme paths, giving 126 deterministic layout files. The
-default mask is `0x71` (Music, System, CFW, About). The all-enabled mask is
-`0x7f`; its 984-pixel content surface uses the stock vertical-scroll gesture
-model rather than shrinking touch targets.
+All 41 safe masks retain CFW and contain four through six large tiles. They are
+generated for all three stock theme paths, giving 123 deterministic layout
+files. The default mask is `0x71` (Music, System, CFW, About). Every optional
+stock tile is individually restorable after disabling another tile. A seventh
+tile is rejected without changing persistent state and reports `Maximum 6
+launcher tiles. Disable one first.`
+
+The all-seven `0x7f` layout is deliberately unsupported in v0.1. Testing found
+that the proprietary stock HGL drag/click path was not reliable enough for a
+release gate, and the user approved a six-tile stability cap. Proper launcher
+scrolling is deferred to v0.2 instead of shrinking touch targets or shipping an
+unstable gesture hook.
 
 The sidecar atomically persists the selected two-digit lowercase hexadecimal
 mask as:
@@ -286,12 +293,13 @@ launcher_mask=71
 ```
 
 `S90r1-cfw` validates a complete three-theme variant set before bind-mounting
-it over the stock launcher resources. Missing or malformed state falls back to
-`71`; any partial bind failure removes all CFW binds and exposes the stock
-SquashFS layouts. Changes apply on the next player/userland restart because the
-stock process caches its parsed launcher tree. Hidden Stream, Wireless, and
-eBook tiles remain installed and can be restored; hiding a tile does not remove
-its backend.
+it over the stock launcher resources. Missing, malformed, or legacy `7f` state
+falls back to `71` without rewriting the configuration during boot; the sidecar
+canonicalizes invalid state when next opened. Any partial bind failure removes
+all CFW binds and exposes the stock SquashFS layouts. Changes apply on the next
+player/userland restart because the stock process caches its parsed launcher
+tree. Hidden Stream, Wireless, and eBook tiles remain installed and can be
+restored; hiding a tile does not remove its backend.
 
 ### CFW menu
 
@@ -336,8 +344,10 @@ timestamps, including continuation areas. Repeated delayed builds from the same
 base and source tree therefore produce byte-identical UPT files. A fail-fast
 lock below `work/r1-cfw-0.1/` covers the complete prepare/publish lifecycle, so
 two invocations cannot mix or replace one another's verification trees. The
-publish copy is also hashed again against the exact UPT verified earlier in the
-same locked run before its atomic rename into `dist/`.
+candidate is first copied to one workspace-owned snapshot; verification unpacks
+that snapshot and publication copies only that same file. The publish copy is
+also hashed again against the exact UPT verified earlier in the same locked run
+before its atomic rename into `dist/`.
 
 Inspect the fail-closed matrix, then validate the prepared candidate:
 
@@ -363,20 +373,77 @@ from that extraction rather than trusting the parallel prepared tree. It hashes
 the image again immediately before writing PASS, so a candidate changed during
 the run cannot inherit its evidence.
 
-The matrix covers the stock baseline; default and all-enabled launchers;
-launcher persistence and scrolling; three sidecar open/Back cycles with
-framebuffer restoration; and a forced sidecar `SIGABRT` followed by proof that
-the player remains alive, its framebuffer is restored, and Music still accepts
-touch input. It also covers SSH off/on; storage, SD, memory, and system pages;
-and the Wi-Fi/Bluetooth stock-hub routes. Hardware radio, DAC, NAND, recovery,
-and board-level behavior are explicitly outside qemu-user coverage.
+The matrix covers the stock baseline; default mask `71`; six-tile mask `77`;
+every visible six-tile route; rejection of a seventh tile with unchanged state;
+drag without activation; an eBook-restoring swap to alternate six-tile mask
+`7d`; persistence; and deterministic restart position. It also runs three
+sidecar open/Back cycles with framebuffer restoration and forces one sidecar
+`SIGABRT`, then proves that the player remains alive, restores the framebuffer,
+and still accepts a Music touch.
+
+SSH coverage runs the exact candidate's MIPS BusyBox controller toggle and
+status paths, generates a Dropbear host key, executes `uid=0` commands through
+both public-key and password authentication, proves a writable `/usr/data`
+round trip, and rejects an unknown key and wrong password. The transport is a
+private, network-isolated qemu-user relay. The matrix also covers storage, SD,
+memory, and system pages plus the Wi-Fi/Bluetooth stock-hub routes. Hardware
+radio, DAC, NAND, recovery, and board-level behavior are explicitly outside
+qemu-user coverage.
+
+The exact mandatory check IDs are:
+
+```text
+preflight.exact-candidate
+stock.launcher
+stock.mp3-fixture
+default.launcher.71
+default.stock-routes
+cfw.lifecycle
+cfw.framebuffer-restore
+cfw.crash-recovery
+cfw.ssh
+ssh.runtime-auth
+cfw.information-pages
+cfw.launcher-settings
+cfw.wifi-route
+cfw.bluetooth-route
+launcher.persistence.77
+launcher.six-tile-routes
+launcher.maximum-rejected
+launcher.drag-no-activation
+launcher.ebook-swap
+launcher.alternate-six-persistence
+launcher.restart-position
+storage.sd-present
+storage.sd-absent
+storage.sd-state-distinct
+```
 
 The validation run writes its ignored evidence below `artifacts/ui/cfw-v0.1/`,
 including a PASS manifest bound to the exact candidate rootfs SHA-256. The
-publish stage independently re-verifies the candidate, all 23 mandatory PASS
+publish stage independently re-verifies the candidate, all 24 mandatory PASS
 records, and the identity, dimensions, complete PNG structure, and SHA-256 of
-the three featured framebuffer captures. It fails for missing, malformed,
-failed, tampered, or stale evidence:
+these three featured framebuffer captures:
+
+```text
+default-compact-launcher.png
+cfw-main.png
+six-tile-launcher.png
+```
+
+It also recomputes the candidate BusyBox, SSH controller, and Dropbear hashes
+directly from the exact SquashFS and rehashes the image after those reads. The
+gate fails for missing, malformed, failed, tampered, or stale evidence. The
+standalone verifier command is:
+
+```bash
+python3 tools/verify_cfw_validation.py \
+  artifacts/ui/cfw-v0.1/validation-manifest.json \
+  "$candidate_rootfs_sha256" \
+  work/r1-cfw-0.1/check/images/rootfs.squashfs
+```
+
+Publication invokes the same gate before its atomic copy:
 
 ```bash
 tools/build-cfw-0.1.sh publish r1.upt

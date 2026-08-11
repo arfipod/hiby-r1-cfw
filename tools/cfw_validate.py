@@ -18,10 +18,13 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -32,12 +35,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNNER = REPO_ROOT / "tools/run-r1-ui-qemu.sh"
 DEFAULT_ARTIFACTS = REPO_ROOT / "artifacts/ui/cfw-v0.1"
 DEFAULT_RUNTIME_ROOT = REPO_ROOT / "work/cfw-qemu-validation"
+SSH_SOCKET_SHIM_SOURCE = REPO_ROOT / "tools/r1-qemu-ssh/inetd_socket_shim.c"
+SSH_FIFO_PROXY = REPO_ROOT / "tools/r1-qemu-ssh/fifo_proxy.py"
+SSH_BINFMT_HELPER = REPO_ROOT / "tools/r1-qemu-ssh/binfmt-bwrap.sh"
+SSH_WRONG_ASKPASS = REPO_ROOT / "tools/r1-qemu-ssh/wrong-askpass.sh"
+SSH_ASKPASS = REPO_ROOT / "tests/fixtures/ssh-askpass.sh"
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 FRAMEBUFFER_WIDTH = 480
 FRAMEBUFFER_HEIGHT = 800
 QEMU_SCOPE = "qemu-user application harness; not X1600 board emulation"
+PLAYER_READY_MARKER = "running activity lg_activity_main"
 
 CFW_STATE = struct.Struct("<7I")
 CFW_STATE_MAGIC = 0x52314346
@@ -65,7 +74,9 @@ ROUTE_BLUETOOTH = 22
 
 DEFAULT_MASK = 0x71
 SIX_TILE_MASK = 0x77
-ALL_MASK = 0x7F
+ALTERNATE_SIX_MASK = 0x7D
+CFW_TILE_BIT = 0x20
+ALL_TILE_BITS = 0x7F
 
 CFW_MAIN_ROWS = {
     "ssh": 0,
@@ -90,16 +101,17 @@ REQUIRED_CHECKS = frozenset(
         "cfw.framebuffer-restore",
         "cfw.crash-recovery",
         "cfw.ssh",
+        "ssh.runtime-auth",
         "cfw.information-pages",
         "cfw.launcher-settings",
         "cfw.wifi-route",
         "cfw.bluetooth-route",
-        "launcher.persistence.7f",
-        "launcher.all-enabled-routes",
-        "launcher.scroll-up",
-        "launcher.scroll-no-activation",
-        "launcher.tap-after-scroll",
-        "launcher.scroll-down",
+        "launcher.persistence.77",
+        "launcher.six-tile-routes",
+        "launcher.maximum-rejected",
+        "launcher.drag-no-activation",
+        "launcher.ebook-swap",
+        "launcher.alternate-six-persistence",
         "launcher.restart-position",
         "storage.sd-present",
         "storage.sd-absent",
@@ -110,7 +122,13 @@ REQUIRED_CHECKS = frozenset(
 FEATURED_SCREENSHOTS = {
     "default-compact-launcher.png": "default-launcher-71",
     "cfw-main.png": "cfw-main-sd-present",
-    "all-tiles-scrolled.png": "all-enabled-scrolled",
+    "six-tile-launcher.png": "six-tile-launcher-77",
+}
+
+CANDIDATE_SSH_COMPONENTS = {
+    "busybox": "bin/busybox",
+    "controller": "usr/bin/r1-ssh-control",
+    "dropbear": "usr/sbin/dropbearmulti",
 }
 
 PLAN = (
@@ -122,12 +140,15 @@ PLAN = (
     "Open/back the CFW sidecar three times and prove framebuffer restoration",
     "Force one sidecar SIGABRT and prove player, framebuffer, and touch recovery",
     "Toggle SSH off/on, reopen CFW, then toggle off",
+    "Execute exact-candidate Dropbear and prove controller, key, and password auth",
     "Capture Internal, microSD, Memory, System information, and About pages",
-    "Change launcher masks 0x71 -> 0x73 -> 0x77 -> 0x7f",
+    "Change launcher masks 0x71 -> 0x73 -> 0x77",
+    "Reject a seventh tile with the exact maximum-six notice and unchanged config",
+    "Reject the locked CFW row and drag gestures without changing the mask",
     "Route CFW Wi-Fi and Bluetooth rows to the stock Wireless hub",
-    "Restart with persisted mask 0x7f and exercise every enabled tile",
-    "Swipe up/down, reject activation during drag, and tap after scrolling",
-    "Restart again and prove deterministic initial scroll position",
+    "Restart with persisted mask 0x77 and exercise all six visible tiles",
+    "Swap Streaming for eBook, restart, and prove the eBook route is restorable",
+    "Restart the alternate six-tile mask again and prove deterministic position",
     "Boot a separate SD-absent session and compare the microSD page",
     "Write PASS only if every mandatory check succeeded",
 )
@@ -412,6 +433,7 @@ class QemuSession:
         self.extra_environment = dict(extra_environment or {})
         self.process: subprocess.Popen[str] | None = None
         self.log_stream: Any = None
+        self.log_path: Path | None = None
 
     @property
     def framebuffer(self) -> Path:
@@ -438,6 +460,7 @@ class QemuSession:
             raise ValidationError(f"session {self.name} is already running")
         self.runtime.parent.mkdir(parents=True, exist_ok=True)
         log_path = self.evidence.logs_dir / f"{self.name}.log"
+        self.log_path = log_path
         self.log_stream = log_path.open("w", encoding="utf-8")
         environment = os.environ.copy()
         environment.update(
@@ -459,6 +482,7 @@ class QemuSession:
             text=True,
             start_new_session=True,
         )
+        self.wait_player_ready()
         snapshot = self.wait_stable_frame()
         if stock_launcher:
             classification = nav.classify_launcher(snapshot.image)
@@ -501,6 +525,27 @@ class QemuSession:
     def capture(self) -> Any:
         self.assert_alive()
         return nav.capture_coherent_frame(self.framebuffer, self.frame_state)
+
+    def wait_player_ready(self) -> None:
+        if self.log_path is None:
+            raise ValidationError(f"session {self.name} has no player log")
+        deadline = time.monotonic() + self.boot_timeout
+        last_text = ""
+        while time.monotonic() < deadline:
+            self.assert_alive()
+            try:
+                last_text = self.log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                last_text = ""
+            if PLAYER_READY_MARKER in last_text:
+                return
+            time.sleep(0.05)
+        raise ValidationError(
+            f"session {self.name} did not reach the player readiness marker; "
+            f"log_tail={last_text[-500:]!r}"
+        )
 
     def save(self, label: str, snapshot: Any | None = None) -> tuple[Any, str]:
         current = snapshot or self.capture()
@@ -600,6 +645,725 @@ class QemuSession:
         raise ValidationError(f"semantic transition timed out for {label}; last={last}")
 
 
+def terminate_process_group(process: subprocess.Popen[Any] | None) -> None:
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if process.poll() is not None:
+        return
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=3)
+
+
+def copy_descriptor(source: int, destination: int) -> None:
+    """Copy one raw stream direction without sandbox-blocked socket syscalls."""
+
+    try:
+        while True:
+            block = os.read(source, 65536)
+            if not block:
+                return
+            view = memoryview(block)
+            while view:
+                view = view[os.write(destination, view) :]
+    except OSError:
+        return
+
+
+def build_ssh_socket_shim(runtime: Path, log_path: Path) -> Path:
+    zig = REPO_ROOT / "work/host-tools/zig-x86_64-linux-0.16.0/zig"
+    if not zig.is_file() or not os.access(zig, os.X_OK):
+        raise ValidationError(f"missing Zig compiler for SSH runtime shim: {zig}")
+    if not SSH_SOCKET_SHIM_SOURCE.is_file():
+        raise ValidationError(f"missing SSH runtime shim source: {SSH_SOCKET_SHIM_SOURCE}")
+    output = runtime / "build/libr1-qemu-inetd-socket.so"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ZIG_GLOBAL_CACHE_DIR": str(runtime / "zig-cache/global"),
+            "ZIG_LOCAL_CACHE_DIR": str(runtime / "zig-cache/local"),
+        }
+    )
+    Path(environment["ZIG_GLOBAL_CACHE_DIR"]).mkdir(parents=True)
+    Path(environment["ZIG_LOCAL_CACHE_DIR"]).mkdir(parents=True)
+    command = [
+        str(zig),
+        "cc",
+        "-target",
+        "mipsel-linux-gnueabihf.2.22",
+        "-march=mips32r2",
+        "-mabi=32",
+        "-Os",
+        "-fPIC",
+        "-shared",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wl,-soname,libr1-qemu-inetd-socket.so",
+        "-o",
+        str(output),
+        str(SSH_SOCKET_SHIM_SOURCE),
+    ]
+    with log_path.open("w", encoding="utf-8") as stream:
+        subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+    if not output.is_file() or output.stat().st_size == 0:
+        raise ValidationError("SSH runtime socket shim build produced no output")
+    return output
+
+
+def ssh_guest_command(
+    rootfs: Path,
+    user_data: Path,
+    run_dir: Path,
+    shim: Path,
+    arguments: Sequence[str],
+    *,
+    preload_shim: bool,
+) -> tuple[list[str], dict[str, str]]:
+    qemu = REPO_ROOT / "work/host-tools/qemu-user/usr/bin/qemu-mipsel"
+    bwrap = shutil.which("bwrap")
+    unshare = shutil.which("unshare")
+    dependencies = (
+        ("qemu-mipsel", str(qemu)),
+        ("bwrap", bwrap),
+        ("unshare", unshare),
+        ("binfmt helper", str(SSH_BINFMT_HELPER)),
+    )
+    for label, path in dependencies:
+        if not path or not Path(path).is_file():
+            raise ValidationError(f"missing SSH runtime dependency: {label}")
+    command = [
+        str(unshare),
+        "--user",
+        "--mount",
+        "--net",
+        "--map-root-user",
+        str(SSH_BINFMT_HELPER),
+        str(qemu),
+        str(bwrap),
+        "--die-with-parent",
+        "--ro-bind",
+        str(rootfs),
+        "/",
+        "--tmpfs",
+        "/tmp",
+        "--ro-bind",
+        str(qemu),
+        "/tmp/r1-host-qemu",
+        "--ro-bind",
+        str(shim),
+        "/tmp/libr1-qemu-inetd-socket.so",
+        "--bind",
+        str(user_data),
+        "/usr/data",
+        "--bind",
+        str(run_dir),
+        "/run",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--chdir",
+        "/root",
+        "/tmp/r1-host-qemu",
+        *arguments,
+    ]
+    environment = os.environ.copy()
+    environment.pop("QEMU_SET_ENV", None)
+    environment.update({"QEMU_CPU": "XBurstR2", "QEMU_LD_PREFIX": "/"})
+    if preload_shim:
+        environment["QEMU_SET_ENV"] = (
+            "LD_PRELOAD=/tmp/libr1-qemu-inetd-socket.so"
+        )
+    return command, environment
+
+
+def run_ssh_authentication(
+    *,
+    trial: str,
+    exact_root: Path,
+    runtime: Path,
+    user_data: Path,
+    run_dir: Path,
+    shim: Path,
+    client_key: Path,
+    unknown_key: Path,
+    evidence: Evidence,
+    timeout: float,
+) -> dict[str, Any]:
+    trials = {
+        "publickey": ("publickey", True),
+        "password": ("password", True),
+        "unknown-key": ("publickey", False),
+        "wrong-password": ("password", False),
+    }
+    if trial not in trials:
+        raise ValidationError(f"unsupported SSH authentication trial: {trial}")
+    method, expected_authenticated = trials[trial]
+    to_server = runtime / f"{trial}-to-server.fifo"
+    from_server = runtime / f"{trial}-from-server.fifo"
+    proxy_ready = runtime / f"{trial}-proxy-ready"
+    os.mkfifo(to_server, 0o600)
+    os.mkfifo(from_server, 0o600)
+    to_anchor = os.open(to_server, os.O_RDWR | os.O_NONBLOCK)
+    from_anchor = os.open(from_server, os.O_RDWR | os.O_NONBLOCK)
+    to_descriptor = os.open(to_server, os.O_RDONLY)
+    from_descriptor = os.open(from_server, os.O_WRONLY)
+    server_socket, relay_socket = socket.socketpair()
+    relay_descriptor = relay_socket.detach()
+    server_log_path = evidence.logs_dir / f"ssh-{trial}-server.log"
+    client_log_path = evidence.logs_dir / f"ssh-{trial}-client.log"
+    server_stream = server_log_path.open("wb")
+    client_stream = client_log_path.open("wb")
+    server_process: subprocess.Popen[bytes] | None = None
+    client_process: subprocess.Popen[bytes] | None = None
+    relay_threads: list[threading.Thread] = []
+    result: dict[str, Any] | None = None
+    try:
+        command, environment = ssh_guest_command(
+            exact_root,
+            user_data,
+            run_dir,
+            shim,
+            (
+                "/usr/sbin/dropbear",
+                "-i",
+                "-m",
+                "-r",
+                "/usr/data/dropbear/dropbear_ed25519_host_key",
+            ),
+            preload_shim=True,
+        )
+        server_process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            env=environment,
+            stdin=server_socket,
+            stdout=server_socket,
+            stderr=server_stream,
+            start_new_session=True,
+        )
+        server_socket.close()
+        relay_threads.append(threading.Thread(
+            target=copy_descriptor,
+            args=(to_descriptor, relay_descriptor),
+            daemon=True,
+        ))
+        relay_threads.append(threading.Thread(
+            target=copy_descriptor,
+            args=(relay_descriptor, from_descriptor),
+            daemon=True,
+        ))
+        for relay_thread in relay_threads:
+            relay_thread.start()
+
+        proxy = shlex.join(
+            (
+                sys.executable,
+                str(SSH_FIFO_PROXY),
+                str(to_server),
+                str(from_server),
+                "--ready",
+                str(proxy_ready),
+            )
+        )
+        ssh = shutil.which("ssh")
+        if not ssh or not SSH_FIFO_PROXY.is_file():
+            raise ValidationError("OpenSSH client or FIFO proxy helper is missing")
+        client_command = [
+            ssh,
+            "-vv",
+            "-F",
+            "/dev/null",
+            "-o",
+            f"ProxyCommand={proxy}",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            f"ConnectTimeout={max(1, int(timeout))}",
+            "-o",
+            "KexAlgorithms=curve25519-sha256",
+            "-o",
+            "HostKeyAlgorithms=ssh-ed25519",
+            "-o",
+            "Ciphers=aes128-ctr",
+        ]
+        client_environment = os.environ.copy()
+        if method == "publickey":
+            identity = client_key if expected_authenticated else unknown_key
+            client_command.extend(
+                (
+                    "-i",
+                    str(identity),
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "PasswordAuthentication=no",
+                )
+            )
+            server_marker = "Pubkey auth succeeded for 'root'"
+        else:
+            askpass = SSH_ASKPASS if expected_authenticated else SSH_WRONG_ASKPASS
+            if not askpass.is_file() or not os.access(askpass, os.X_OK):
+                raise ValidationError(f"SSH askpass helper is missing: {askpass}")
+            client_command.extend(
+                (
+                    "-o",
+                    "PreferredAuthentications=password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                )
+            )
+            client_environment.update(
+                {
+                    "DISPLAY": ":0",
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "SSH_ASKPASS": str(askpass),
+                }
+            )
+            server_marker = "Password auth succeeded for 'root'"
+        client_command.append("root@r1-cfw-qemu")
+        proof_token = f"r1-cfw-{trial}-root-session"
+        proof_file = user_data / "dropbear" / f"{trial}-session-proof"
+        if expected_authenticated:
+            guest_proof = f"/usr/data/dropbear/{trial}-session-proof"
+            remote_command = (
+                "umask 077; "
+                f"printf '%s\\n' {shlex.quote(proof_token)} > {shlex.quote(guest_proof)}; "
+                "printf 'R1_UID=%s\\n' \"$(id -u)\"; "
+                f"printf 'R1_FS='; cat {shlex.quote(guest_proof)}"
+            )
+        else:
+            remote_command = "true"
+        client_command.append(remote_command)
+        client_process = subprocess.Popen(
+            client_command,
+            cwd=REPO_ROOT,
+            env=client_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=client_stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        ready_deadline = time.monotonic() + min(timeout, 5.0)
+        while time.monotonic() < ready_deadline and not proxy_ready.is_file():
+            if client_process.poll() is not None:
+                break
+            time.sleep(0.02)
+        if not proxy_ready.is_file():
+            raise ValidationError(f"SSH {trial} FIFO proxy did not become ready")
+        os.close(to_anchor)
+        to_anchor = -1
+        os.close(from_anchor)
+        from_anchor = -1
+        try:
+            client_returncode = client_process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise ValidationError(
+                f"exact-candidate SSH {trial} trial timed out"
+            ) from error
+        try:
+            server_process.wait(timeout=min(timeout, 5.0))
+        except subprocess.TimeoutExpired:
+            pass
+        server_stream.flush()
+        client_stream.flush()
+        server_text = server_log_path.read_text(encoding="utf-8", errors="replace")
+        client_text = client_log_path.read_text(encoding="utf-8", errors="replace")
+        server_authenticated = server_marker in server_text
+        client_authenticated = bool(
+            re.search(
+                rf'Authenticated to .* using "{re.escape(method)}"', client_text
+            )
+        )
+        if expected_authenticated:
+            if (
+                client_returncode != 0
+                or not server_authenticated
+                or not client_authenticated
+                or "R1_UID=0" not in client_text
+                or f"R1_FS={proof_token}" not in client_text
+                or not proof_file.is_file()
+                or proof_file.read_text(encoding="ascii") != f"{proof_token}\n"
+            ):
+                raise ValidationError(
+                    f"exact-candidate SSH {trial} root session failed; "
+                    f"server_log={server_log_path}, client_log={client_log_path}"
+                )
+            result = {
+                "trial": trial,
+                "method": method,
+                "expected_authenticated": True,
+                "server_authenticated": True,
+                "client_authenticated": True,
+                "root_command_executed": True,
+                "root_uid": 0,
+                "filesystem_proof": proof_token,
+            }
+        else:
+            if (
+                client_returncode == 0
+                or server_authenticated
+                or client_authenticated
+                or "Permission denied" not in client_text
+            ):
+                raise ValidationError(
+                    f"exact-candidate SSH {trial} credential was not rejected; "
+                    f"server_log={server_log_path}, client_log={client_log_path}"
+                )
+            result = {
+                "trial": trial,
+                "method": method,
+                "expected_authenticated": False,
+                "server_authenticated": False,
+                "client_authenticated": False,
+                "client_rejected": True,
+            }
+    finally:
+        terminate_process_group(client_process)
+        terminate_process_group(server_process)
+        server_socket.close()
+        for descriptor in (
+            relay_descriptor,
+            to_descriptor,
+            from_descriptor,
+            to_anchor,
+            from_anchor,
+        ):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        for relay_thread in relay_threads:
+            relay_thread.join(timeout=2)
+        client_stream.close()
+        server_stream.close()
+    if any(relay_thread.is_alive() for relay_thread in relay_threads):
+        raise ValidationError(f"SSH {trial} relay thread did not terminate")
+    if result is None:
+        raise ValidationError(f"SSH {trial} trial produced no result")
+    result.update(
+        {
+            "run_id": evidence.run_dir.name,
+            "server_log": server_log_path.relative_to(evidence.artifacts).as_posix(),
+            "server_log_sha256": sha256_file(server_log_path),
+            "client_log": client_log_path.relative_to(evidence.artifacts).as_posix(),
+            "client_log_sha256": sha256_file(client_log_path),
+        }
+    )
+    return result
+
+
+def validate_ssh_runtime(
+    exact_root: Path,
+    runtime: Path,
+    evidence: Evidence,
+    timeout: float,
+) -> None:
+    runtime.mkdir(parents=True)
+    user_data = runtime / "usr-data"
+    state_dir = user_data / "dropbear"
+    run_dir = runtime / "run"
+    keys_dir = runtime / "keys"
+    for path in (state_dir, run_dir, keys_dir):
+        path.mkdir(parents=True)
+    os.chmod(state_dir, 0o700)
+
+    controller = exact_root / "usr/bin/r1-ssh-control"
+    dropbear = exact_root / "usr/sbin/dropbearmulti"
+    if not controller.is_file() or not os.access(controller, os.X_OK):
+        raise ValidationError("exact candidate SSH controller is missing or not executable")
+    if not dropbear.is_file() or not os.access(dropbear, os.X_OK):
+        raise ValidationError("exact candidate Dropbear is missing or not executable")
+
+    shim = build_ssh_socket_shim(
+        runtime, evidence.logs_dir / "ssh-inetd-shim-build.log"
+    )
+    controller_log = evidence.logs_dir / "ssh-controller.log"
+    controller_environment = os.environ.copy()
+    controller_environment.update(
+        {
+            "R1_SSH_STATE_DIR": "/usr/data/dropbear",
+            "R1_SSH_RUN_DIR": "/run",
+            "R1_SSH_SD_ROOT": "/usr/data/mnt/sd_0",
+            "R1_SSH_DEVELOPER_DISABLED": "/usr/data/disableadb",
+        }
+    )
+    (user_data / "mnt/sd_0").mkdir(parents=True)
+    with controller_log.open("w", encoding="utf-8") as stream:
+        def controller_run(command: str, expected: int) -> None:
+            guest_command, guest_environment = ssh_guest_command(
+                exact_root,
+                user_data,
+                run_dir,
+                shim,
+                (
+                    "/bin/sh",
+                    "/usr/bin/r1-ssh-control",
+                    command,
+                ),
+                preload_shim=False,
+            )
+            guest_environment.update(controller_environment)
+            result = subprocess.run(
+                guest_command,
+                cwd=REPO_ROOT,
+                env=guest_environment,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if result.returncode != expected:
+                raise ValidationError(
+                    f"exact candidate SSH controller {command} returned "
+                    f"{result.returncode}; expected {expected}"
+                )
+
+        controller_run("disable", 0)
+        controller_run("is-enabled", 1)
+        controller_run("toggle", 0)
+        controller_run("is-enabled", 0)
+        controller_run("toggle", 0)
+        controller_run("is-enabled", 1)
+        controller_run("enable", 0)
+        controller_run("is-enabled", 0)
+        controller_run("status", 1)
+    enabled = state_dir / "enabled"
+    disabled = state_dir / "disabled"
+    if not enabled.is_file() or disabled.exists():
+        raise ValidationError("exact candidate controller did not persist enabled state")
+    controller_text = controller_log.read_text(encoding="utf-8", errors="replace")
+    for marker in (
+        "SSH is disabled",
+        "disabled",
+        "SSH is enabled; Dropbear will follow the wlan0 IPv4 address",
+        "enabled",
+        "SSH toggle is enabled",
+        "Dropbear is stopped",
+    ):
+        if marker not in controller_text:
+            raise ValidationError(
+                f"target-BusyBox controller log lacks marker: {marker!r}"
+            )
+    version_command, version_environment = ssh_guest_command(
+        exact_root,
+        user_data,
+        run_dir,
+        shim,
+        ("/usr/sbin/dropbear", "-V"),
+        preload_shim=False,
+    )
+    version = subprocess.run(
+        version_command,
+        cwd=REPO_ROOT,
+        env=version_environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    version_text = (version.stdout + version.stderr).strip()
+    if not re.fullmatch(r"Dropbear v[0-9][0-9.]*", version_text):
+        raise ValidationError(f"unexpected exact-candidate Dropbear version: {version_text!r}")
+
+    host_key = state_dir / "dropbear_ed25519_host_key"
+    key_command, key_environment = ssh_guest_command(
+        exact_root,
+        user_data,
+        run_dir,
+        shim,
+        (
+            "/usr/bin/dropbearkey",
+            "-t",
+            "ed25519",
+            "-f",
+            "/usr/data/dropbear/dropbear_ed25519_host_key",
+        ),
+        preload_shim=False,
+    )
+    with (evidence.logs_dir / "ssh-host-key.log").open("w", encoding="utf-8") as stream:
+        subprocess.run(
+            key_command,
+            cwd=REPO_ROOT,
+            env=key_environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+    if not host_key.is_file() or host_key.stat().st_size == 0:
+        raise ValidationError("exact-candidate Dropbear failed to generate an ED25519 host key")
+    os.chmod(host_key, 0o600)
+
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        raise ValidationError("ssh-keygen is required for exact-candidate SSH validation")
+    client_key = keys_dir / "client"
+    subprocess.run(
+        [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    unknown_key = keys_dir / "unknown-client"
+    subprocess.run(
+        [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(unknown_key)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    authorized_keys = state_dir / "authorized_keys"
+    shutil.copyfile(client_key.with_suffix(".pub"), authorized_keys)
+    os.chmod(authorized_keys, 0o600)
+
+    publickey = run_ssh_authentication(
+        trial="publickey",
+        exact_root=exact_root,
+        runtime=runtime,
+        user_data=user_data,
+        run_dir=run_dir,
+        shim=shim,
+        client_key=client_key,
+        unknown_key=unknown_key,
+        evidence=evidence,
+        timeout=timeout,
+    )
+    password = run_ssh_authentication(
+        trial="password",
+        exact_root=exact_root,
+        runtime=runtime,
+        user_data=user_data,
+        run_dir=run_dir,
+        shim=shim,
+        client_key=client_key,
+        unknown_key=unknown_key,
+        evidence=evidence,
+        timeout=timeout,
+    )
+    unknown_key_rejection = run_ssh_authentication(
+        trial="unknown-key",
+        exact_root=exact_root,
+        runtime=runtime,
+        user_data=user_data,
+        run_dir=run_dir,
+        shim=shim,
+        client_key=client_key,
+        unknown_key=unknown_key,
+        evidence=evidence,
+        timeout=timeout,
+    )
+    wrong_password_rejection = run_ssh_authentication(
+        trial="wrong-password",
+        exact_root=exact_root,
+        runtime=runtime,
+        user_data=user_data,
+        run_dir=run_dir,
+        shim=shim,
+        client_key=client_key,
+        unknown_key=unknown_key,
+        evidence=evidence,
+        timeout=timeout,
+    )
+
+    with controller_log.open("a", encoding="utf-8") as stream:
+        guest_command, guest_environment = ssh_guest_command(
+            exact_root,
+            user_data,
+            run_dir,
+            shim,
+            (
+                "/bin/sh",
+                "/usr/bin/r1-ssh-control",
+                "disable",
+            ),
+            preload_shim=False,
+        )
+        guest_environment.update(controller_environment)
+        result = subprocess.run(
+            guest_command,
+            cwd=REPO_ROOT,
+            env=guest_environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    if result.returncode != 0 or enabled.exists() or not disabled.is_file():
+        raise ValidationError("exact candidate controller did not persist disabled state")
+    evidence.record(
+        "ssh.runtime-auth",
+        candidate_components={
+            name: {
+                "path": path,
+                "sha256": sha256_file(exact_root / path),
+            }
+            for name, path in CANDIDATE_SSH_COMPONENTS.items()
+        },
+        dropbear_version=version_text,
+        host_key_generated=True,
+        controller={
+            "target_busybox_qemu": True,
+            "commands": [
+                "disable",
+                "is-enabled(disabled)",
+                "toggle(enabled)",
+                "is-enabled(enabled)",
+                "toggle(disabled)",
+                "is-enabled(disabled)",
+                "enable",
+                "is-enabled(enabled)",
+                "status(stopped)",
+                "disable",
+            ],
+            "enable_disable_persisted": True,
+            "direct_toggle": True,
+            "self_reexec_adapter": False,
+            "log": controller_log.relative_to(evidence.artifacts).as_posix(),
+            "log_sha256": sha256_file(controller_log),
+            "run_id": evidence.run_dir.name,
+        },
+        publickey=publickey,
+        password=password,
+        unknown_key_rejection=unknown_key_rejection,
+        wrong_password_rejection=wrong_password_rejection,
+        transport=(
+            "network-isolated qemu-user Dropbear inetd over an inherited "
+            "AF_UNIX socketpair and private FIFO ProxyCommand relay"
+        ),
+        emulator_adapters=[
+            "loopback sockaddr metadata for sandbox-blocked socket inspection",
+            "single-root-group setgroups acknowledgement inside user namespace",
+        ],
+        hardware_operation_claimed=False,
+    )
+
+
 def main_row_y(row: int) -> int:
     return 80 + row * 72 + 36
 
@@ -608,12 +1372,21 @@ def launcher_row_y(row: int) -> int:
     return 80 + row * 72 + 36
 
 
+def safe_launcher_mask(mask: int) -> bool:
+    return (
+        not mask & ~ALL_TILE_BITS
+        and bool(mask & CFW_TILE_BIT)
+        and 4 <= mask.bit_count() <= 6
+    )
+
+
 def open_cfw(session: QemuSession, point: tuple[int, int]) -> tuple[Any, SemanticState]:
-    launcher = session.capture()
+    launcher = session.wait_stable_frame()
     session.clear_semantic()
     session.tap(*point)
     state = session.wait_semantic(
-        lambda item: item.screen == SCREEN_MAIN and item.launcher_mask in {DEFAULT_MASK, ALL_MASK},
+        lambda item: item.screen == SCREEN_MAIN
+        and safe_launcher_mask(item.launcher_mask),
         label="open CFW",
     )
     session.wait_change(launcher.content_sha256)
@@ -666,6 +1439,11 @@ def stock_tile_roundtrip(
     path = session.evidence.screenshot(session.name, f"route-{name}", page) if capture else None
     session.tap(45, 92)
     session.wait_hash(launcher_hash)
+    stable = session.wait_stable_frame()
+    if stable.content_sha256 != launcher_hash:
+        raise ValidationError(
+            f"stock route {name} did not settle on the restored launcher"
+        )
     return path
 
 
@@ -800,7 +1578,7 @@ def validate_candidate_default(
     )
     _, settings_71 = session.save("launcher-settings-71")
     masks = []
-    for row, expected in ((1, 0x73), (2, SIX_TILE_MASK), (3, ALL_MASK)):
+    for row, expected in ((1, 0x73), (2, SIX_TILE_MASK)):
         session.tap(220, launcher_row_y(row))
         launch_state = session.wait_semantic(
             lambda item, sequence=launch_state.sequence, mask=expected: (
@@ -812,23 +1590,56 @@ def validate_candidate_default(
             label=f"launcher mask {expected:02x}",
         )
         masks.append(f"{expected:02x}")
-    _, settings_7f = session.save("launcher-settings-7f")
-    session.tap(220, launcher_row_y(5))
-    rejected = session.wait_semantic(
+    settings_frame, settings_77 = session.save("launcher-settings-77")
+
+    session.tap(220, launcher_row_y(3))
+    maximum_rejected = session.wait_semantic(
         lambda item: item.sequence > launch_state.sequence
+        and item.screen == SCREEN_LAUNCHER
         and item.action == ACTION_LAUNCHER_REJECTED
-        and item.launcher_mask == ALL_MASK,
+        and item.launcher_mask == SIX_TILE_MASK,
+        label="maximum six launcher tiles",
+    )
+    notice_frame = session.wait_change(settings_frame.content_sha256)
+    _, maximum_path = session.save("launcher-maximum-six-rejected", notice_frame)
+    if config.read_text(encoding="ascii") != "launcher_mask=77\n":
+        raise ValidationError("seventh launcher tile changed canonical mask 0x77")
+    evidence.record(
+        "launcher.maximum-rejected",
+        attempted_tile="ebook",
+        mask="77",
+        config="launcher_mask=77\n",
+        action=ACTION_LAUNCHER_REJECTED,
+        expected_message="Maximum 6 launcher tiles. Disable one first.",
+        framebuffer_changed=True,
+        screenshot=maximum_path,
+    )
+
+    session.tap(220, launcher_row_y(5))
+    locked_rejected = session.wait_semantic(
+        lambda item: item.sequence > maximum_rejected.sequence
+        and item.action == ACTION_LAUNCHER_REJECTED
+        and item.launcher_mask == SIX_TILE_MASK,
         label="locked CFW launcher tile",
     )
     session.drag((150, 250), (215, 250))
-    session.wait_semantic(
-        lambda item: item.sequence > rejected.sequence
+    drag_rejected = session.wait_semantic(
+        lambda item: item.sequence > locked_rejected.sequence
         and item.action == ACTION_DRAG_IGNORED
-        and item.launcher_mask == ALL_MASK,
+        and item.launcher_mask == SIX_TILE_MASK,
         label="launcher-settings drag rejection",
     )
-    if config.read_text(encoding="ascii") != "launcher_mask=7f\n":
-        raise ValidationError("all-enabled launcher mask was not persisted canonically")
+    if config.read_text(encoding="ascii") != "launcher_mask=77\n":
+        raise ValidationError("launcher rejection changed canonical mask 0x77")
+    evidence.record(
+        "launcher.drag-no-activation",
+        mask="77",
+        config="launcher_mask=77\n",
+        locked_cfw_action=locked_rejected.action,
+        drag_action=drag_rejected.action,
+        cfw_tile_locked=True,
+        drag_did_not_toggle=True,
+    )
     session.tap(40, 30)
     session.wait_semantic(
         lambda item: item.screen == SCREEN_MAIN and item.action == ACTION_BACK,
@@ -838,7 +1649,9 @@ def validate_candidate_default(
         "cfw.launcher-settings",
         masks=["71", *masks],
         six_tile_mask="77",
-        screenshots=[settings_71, settings_7f],
+        maximum_tiles=6,
+        screenshots=[settings_71, settings_77, maximum_path],
+        seventh_tile_rejected=True,
         cfw_tile_locked=True,
         drag_did_not_toggle=True,
     )
@@ -872,58 +1685,120 @@ def validate_candidate_default(
     return sd_present_hash
 
 
-def validate_all_enabled(session: QemuSession, evidence: Evidence) -> str:
+def validate_six_tile_launcher(session: QemuSession, evidence: Evidence) -> None:
     launcher = session.start()
     config = session.user_data / "r1-cfw/launcher.conf"
-    if config.read_text(encoding="ascii") != "launcher_mask=7f\n":
-        raise ValidationError("launcher mask 0x7f did not persist across QEMU restart")
-    _, top_path = session.save("all-enabled-top", launcher)
-    evidence.record("launcher.persistence.7f", screenshot=top_path, mask="7f")
+    if config.read_text(encoding="ascii") != "launcher_mask=77\n":
+        raise ValidationError("launcher mask 0x77 did not persist across QEMU restart")
+    _, launcher_path = session.save("six-tile-launcher-77", launcher)
+    evidence.record(
+        "launcher.persistence.77",
+        screenshot=launcher_path,
+        mask="77",
+        config="launcher_mask=77\n",
+        tile_count=6,
+        persisted_across_restart=True,
+    )
+    evidence.promote("six-tile-launcher.png", launcher_path)
 
     routes: dict[str, str | None] = {}
     for name, point in (
         ("music", (120, 173)),
         ("stream", (360, 173)),
         ("wireless", (120, 419)),
-        ("ebook", (360, 419)),
-        ("system", (120, 665)),
+        ("system", (360, 419)),
+        ("about", (360, 665)),
     ):
         routes[name] = stock_tile_roundtrip(
-            session, launcher.content_sha256, f"all-{name}", point
+            session, launcher.content_sha256, f"six-77-{name}", point
         )
 
-    before_scroll = session.capture()
-    session.clear_semantic()
-    session.drag((240, 700), (240, 300))
-    scrolled = session.wait_change(before_scroll.content_sha256)
-    _, scrolled_path = session.save("all-enabled-scrolled", scrolled)
-    evidence.record("launcher.scroll-up", screenshot=scrolled_path)
-    evidence.promote("all-tiles-scrolled.png", scrolled_path)
-    if session.semantic_path.stat().st_size != 0:
-        raise ValidationError("launcher drag unexpectedly activated the CFW tile")
-    evidence.record("launcher.scroll-no-activation", semantic_state_bytes=0)
-
-    about = session.tap_change(120, 700)
-    _, about_path = session.save("all-about-after-scroll", about)
-    routes["about"] = about_path
-    evidence.record("launcher.tap-after-scroll", tile="about", screenshot=about_path)
-    session.tap(45, 92)
-    session.wait_hash(scrolled.content_sha256)
-
-    session.drag((240, 220), (240, 700))
-    restored_top = session.wait_hash(launcher.content_sha256)
-    _, restored_path = session.save("all-enabled-scroll-restored", restored_top)
-    evidence.record("launcher.scroll-down", screenshot=restored_path, bounded=True)
-
-    cfw_launcher, _state = open_cfw(session, (360, 665))
+    cfw_launcher, _state = open_cfw(session, (120, 665))
+    _, cfw_open_path = session.save("six-77-cfw-open")
     _final, restored = leave_cfw(session, cfw_launcher.content_sha256)
-    routes["cfw"] = session.evidence.screenshot(
-        session.name, "all-cfw-restored", restored
+    restored_path = session.evidence.screenshot(
+        session.name, "six-77-cfw-restored", restored
+    )
+    routes["cfw"] = cfw_open_path
+    evidence.record(
+        "launcher.six-tile-routes",
+        mask="77",
+        tiles=["music", "stream", "wireless", "system", "cfw", "about"],
+        screenshots=routes,
+        cfw_restored_screenshot=restored_path,
+        all_routes_restored=True,
+    )
+
+    baseline, main_state = open_cfw(session, (120, 665))
+    session.tap(220, main_row_y(CFW_MAIN_ROWS["launcher"]))
+    settings_state = session.wait_semantic(
+        lambda item: item.sequence > main_state.sequence
+        and item.screen == SCREEN_LAUNCHER
+        and item.launcher_mask == SIX_TILE_MASK,
+        label="six-tile launcher settings",
+    )
+    session.tap(220, launcher_row_y(1))
+    reduced = session.wait_semantic(
+        lambda item: item.sequence > settings_state.sequence
+        and item.screen == SCREEN_LAUNCHER
+        and item.action == ACTION_LAUNCHER_TOGGLE
+        and item.launcher_mask == 0x75,
+        label="disable Streaming before enabling eBook",
+    )
+    session.tap(220, launcher_row_y(3))
+    alternate = session.wait_semantic(
+        lambda item: item.sequence > reduced.sequence
+        and item.screen == SCREEN_LAUNCHER
+        and item.action == ACTION_LAUNCHER_TOGGLE
+        and item.launcher_mask == ALTERNATE_SIX_MASK,
+        label="enable eBook in alternate six-tile mask",
+    )
+    _, settings_path = session.save("launcher-settings-alternate-six-7d")
+    if config.read_text(encoding="ascii") != "launcher_mask=7d\n":
+        raise ValidationError("alternate six-tile mask was not persisted canonically")
+    session.tap(40, 30)
+    session.wait_semantic(
+        lambda item: item.sequence > alternate.sequence
+        and item.screen == SCREEN_MAIN
+        and item.action == ACTION_BACK,
+        label="back from alternate six-tile settings",
+    )
+    leave_cfw(session, baseline.content_sha256)
+    evidence.record(
+        "launcher.ebook-swap",
+        transitions=["77", "75", "7d"],
+        disabled_tile="stream",
+        enabled_tile="ebook",
+        final_mask="7d",
+        config="launcher_mask=7d\n",
+        screenshot=settings_path,
+        applies_on_restart=True,
+    )
+
+
+def validate_alternate_six_launcher(session: QemuSession, evidence: Evidence) -> str:
+    launcher = session.start()
+    config = session.user_data / "r1-cfw/launcher.conf"
+    if config.read_text(encoding="ascii") != "launcher_mask=7d\n":
+        raise ValidationError("alternate six-tile mask 0x7d did not persist")
+    _, launcher_path = session.save("alternate-six-launcher-7d", launcher)
+    ebook_path = stock_tile_roundtrip(
+        session,
+        launcher.content_sha256,
+        "alternate-7d-ebook",
+        (120, 419),
     )
     evidence.record(
-        "launcher.all-enabled-routes",
-        tiles=["music", "stream", "wireless", "ebook", "system", "cfw", "about"],
-        screenshots=routes,
+        "launcher.alternate-six-persistence",
+        mask="7d",
+        config="launcher_mask=7d\n",
+        tile_count=6,
+        disabled_tile="stream",
+        enabled_tile="ebook",
+        launcher_screenshot=launcher_path,
+        ebook_route_screenshot=ebook_path,
+        ebook_route_restored=True,
+        persisted_across_restart=True,
     )
     return launcher.content_sha256
 
@@ -958,12 +1833,22 @@ def validate_crash_recovery(session: QemuSession, evidence: Evidence) -> None:
 
 def validate_restart_position(session: QemuSession, evidence: Evidence, top_hash: str) -> None:
     launcher = session.start()
+    config = session.user_data / "r1-cfw/launcher.conf"
+    if config.read_text(encoding="ascii") != "launcher_mask=7d\n":
+        raise ValidationError("alternate six-tile mask changed before deterministic restart")
     if launcher.content_sha256 != top_hash:
         raise ValidationError(
-            "all-enabled launcher did not restart at its deterministic top position"
+            "alternate six-tile launcher did not restart at its deterministic position"
         )
-    _, path = session.save("all-enabled-after-second-restart", launcher)
-    evidence.record("launcher.restart-position", screenshot=path, deterministic=True)
+    _, path = session.save("alternate-six-after-second-restart", launcher)
+    evidence.record(
+        "launcher.restart-position",
+        screenshot=path,
+        mask="7d",
+        config="launcher_mask=7d\n",
+        deterministic=True,
+        fixed_position=True,
+    )
 
 
 def validate_sd_absent(
@@ -990,17 +1875,37 @@ def validate_sd_absent(
 
 
 def require_candidate_tree(root: Path, *, label: str) -> None:
+    launcher_root = root / "usr/resource/r1-cfw/launcher"
+    launcher_variants = tuple(
+        launcher_root / theme / mask
+        for theme in ("theme1", "theme2", "midi-theme1")
+        for mask in ("71.view", "77.view", "7d.view")
+    )
     required = (
         root / "lib/ld.so.1",
         root / "usr/bin/hiby_player",
         root / "usr/bin/r1-cfw-ui",
+        root / "usr/bin/r1-ssh-control",
+        root / "usr/bin/dropbearkey",
         root / "usr/lib/libr1-cfw-hook.so",
-        root / "usr/resource/r1-cfw/launcher/theme1/71.view",
-        root / "usr/resource/r1-cfw/launcher/theme1/7f.view",
+        root / "usr/sbin/dropbearmulti",
+        *launcher_variants,
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise ValidationError(f"{label} is missing required files: {missing}")
+    forbidden = [
+        launcher_root / theme / "7f.view"
+        for theme in ("theme1", "theme2", "midi-theme1")
+    ]
+    present = [str(path) for path in forbidden if path.exists()]
+    if present:
+        raise ValidationError(
+            f"{label} contains forbidden seven-tile launcher resources: {present}"
+        )
+    ui_binary = root / "usr/bin/r1-cfw-ui"
+    if b"Maximum 6 launcher tiles. Disable one first." not in ui_binary.read_bytes():
+        raise ValidationError(f"{label} lacks the exact maximum-six launcher UI message")
 
 
 def preflight(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
@@ -1085,11 +1990,33 @@ def run_validation(args: argparse.Namespace) -> int:
             evidence.logs_dir / "extract-exact-candidate.log",
         )
         inputs["validated_candidate_rootfs_dir"] = str(exact_candidate_root)
+        root_backend = os.environ.get("R1_QEMU_ROOT_BACKEND", "auto")
+        sys_server_skipped = os.environ.get("R1_QEMU_SKIP_SYS_SERVER", "0") == "1"
+        inputs["qemu_root_backend_requested"] = root_backend
+        inputs["qemu_sys_server_stub_skipped"] = (
+            "true" if sys_server_skipped else "false"
+        )
         evidence.record(
             "preflight.exact-candidate",
             candidate_rootfs_sha256=digest,
             candidate_rootfs_bytes=candidate_image.stat().st_size,
             execution_tree="independently extracted from candidate_rootfs_image",
+            execution_adapters={
+                "root_backend_requested": root_backend,
+                "sys_server_stub_skipped": sys_server_skipped,
+                "sys_server_stub_skip_reason": (
+                    "managed sandbox denies AF_UNIX socket creation"
+                    if sys_server_skipped
+                    else "not skipped"
+                ),
+                "mandatory_checks_relaxed": False,
+            },
+        )
+        validate_ssh_runtime(
+            exact_candidate_root,
+            runtime_base / "ssh-runtime",
+            evidence,
+            args.ssh_timeout,
         )
 
         common = {
@@ -1129,13 +2056,22 @@ def run_validation(args: argparse.Namespace) -> int:
             validate_crash_recovery(crashed, evidence)
 
         with QemuSession(
-            name="candidate-all",
+            name="candidate-six-77",
             rootfs=exact_candidate_root,
             runtime=candidate_runtime,
             sd_present=True,
             **common,
-        ) as all_enabled:
-            top_hash = validate_all_enabled(all_enabled, evidence)
+        ) as six_tile:
+            validate_six_tile_launcher(six_tile, evidence)
+
+        with QemuSession(
+            name="candidate-alternate-7d",
+            rootfs=exact_candidate_root,
+            runtime=candidate_runtime,
+            sd_present=True,
+            **common,
+        ) as alternate:
+            top_hash = validate_alternate_six_launcher(alternate, evidence)
 
         with QemuSession(
             name="candidate-restart",
@@ -1189,6 +2125,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--expected-rootfs-sha256", default="")
     run.add_argument("--boot-timeout", type=float, default=45.0)
     run.add_argument("--transition-timeout", type=float, default=10.0)
+    run.add_argument("--ssh-timeout", type=float, default=45.0)
     return parser
 
 
@@ -1217,7 +2154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if args.boot_timeout <= 0 or args.transition_timeout <= 0:
+    if args.boot_timeout <= 0 or args.transition_timeout <= 0 or args.ssh_timeout <= 0:
         print("cfw_validate.py: error: timeouts must be positive", file=sys.stderr)
         return 2
     return run_validation(args)

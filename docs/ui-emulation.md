@@ -161,7 +161,7 @@ not indicate that the display adapter failed.
 
 ## Simulated microSD and test music
 
-If `test-audio.mp3` exists at the repository root, the runner preserves the
+If the ignored `misc/test-audio.mp3` fixture exists, the runner preserves the
 source and copies it into the disposable guest SD tree as:
 
 ```text

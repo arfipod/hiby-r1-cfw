@@ -55,7 +55,8 @@ static int valid_mask(uint32_t mask) {
     if (mask & ~R1_CFW_LAUNCHER_ALL) return 0;
     if (!(mask & R1_CFW_TILE_CFW)) return 0;
     count = visible_tiles(mask);
-    return count >= 4 && count <= 7;
+    return count >= R1_CFW_LAUNCHER_MIN_TILES &&
+           count <= R1_CFW_LAUNCHER_MAX_TILES;
 }
 
 void r1_cfw_paths_init(struct r1_cfw_paths *paths) {
@@ -82,6 +83,7 @@ uint32_t r1_cfw_launcher_load(const struct r1_cfw_paths *paths) {
     char path[512];
     char line[80];
     char *end = NULL;
+    size_t line_length;
     unsigned long value;
     FILE *stream;
     if (joined_path(path, sizeof(path), paths->data_dir, "launcher.conf") < 0)
@@ -90,25 +92,39 @@ uint32_t r1_cfw_launcher_load(const struct r1_cfw_paths *paths) {
     if (!stream) return R1_CFW_LAUNCHER_DEFAULT;
     if (!fgets(line, sizeof(line), stream)) {
         fclose(stream);
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
+        return R1_CFW_LAUNCHER_DEFAULT;
+    }
+    line_length = strlen(line);
+    if (fgetc(stream) != EOF || ferror(stream)) {
+        fclose(stream);
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
         return R1_CFW_LAUNCHER_DEFAULT;
     }
     fclose(stream);
-    if (strncmp(line, "launcher_mask=", 14) != 0)
+    if (line_length != 17U ||
+        strncmp(line, "launcher_mask=", 14) != 0 || line[16] != '\n') {
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
         return R1_CFW_LAUNCHER_DEFAULT;
+    }
     if (!((line[14] >= '0' && line[14] <= '9') ||
           (line[14] >= 'a' && line[14] <= 'f')) ||
         !((line[15] >= '0' && line[15] <= '9') ||
-          (line[15] >= 'a' && line[15] <= 'f')) ||
-        (line[16] != '\n' && line[16] != '\0')) {
+          (line[15] >= 'a' && line[15] <= 'f'))) {
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
         return R1_CFW_LAUNCHER_DEFAULT;
     }
     errno = 0;
     value = strtoul(line + 14, &end, 16);
-    if (errno || end != line + 16 || (*end != '\n' && *end != '\0') ||
+    if (errno || end != line + 16 || *end != '\n' ||
         value > R1_CFW_LAUNCHER_ALL) {
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
         return R1_CFW_LAUNCHER_DEFAULT;
     }
-    if (!valid_mask((uint32_t)value)) return R1_CFW_LAUNCHER_DEFAULT;
+    if (!valid_mask((uint32_t)value)) {
+        (void)r1_cfw_launcher_save(paths, R1_CFW_LAUNCHER_DEFAULT);
+        return R1_CFW_LAUNCHER_DEFAULT;
+    }
     return (uint32_t)value;
 }
 
@@ -169,6 +185,10 @@ int r1_cfw_launcher_set(const struct r1_cfw_paths *paths, const char *name,
         if (strcmp(name, launcher_entries[index].name) != 0) continue;
         if (launcher_entries[index].bit == R1_CFW_TILE_CFW && !enabled)
             return -EPERM;
+        if (enabled && !(mask & launcher_entries[index].bit) &&
+            visible_tiles(mask) >= R1_CFW_LAUNCHER_MAX_TILES) {
+            return -ENOSPC;
+        }
         if (enabled)
             mask |= launcher_entries[index].bit;
         else
@@ -182,6 +202,7 @@ int r1_cfw_launcher_set(const struct r1_cfw_paths *paths, const char *name,
 }
 
 static int run_controller(const char *controller, const char *command) {
+    const char *emulator_wrapper = getenv("R1_QEMU_EXEC_WRAPPER");
     pid_t child;
     pid_t waited;
     int status;
@@ -194,7 +215,18 @@ static int run_controller(const char *controller, const char *command) {
             (void)dup2(null_descriptor, STDERR_FILENO);
             if (null_descriptor > STDERR_FILENO) close(null_descriptor);
         }
-        execl(controller, controller, command, (char *)NULL);
+        /* A physical R1 executes the controller through its shebang.  In the
+         * qemu-user harness there is no binfmt_misc registration, so a guest
+         * shell script must be launched through the already-mounted host qemu
+         * wrapper and the target shell explicitly.  Resolve the environment
+         * before fork; the child then performs only async-signal-safe setup
+         * and exec calls. */
+        if (emulator_wrapper && *emulator_wrapper) {
+            execl(emulator_wrapper, emulator_wrapper, "/bin/sh", controller,
+                  command, (char *)NULL);
+        } else {
+            execl(controller, controller, command, (char *)NULL);
+        }
         _exit(127);
     }
     do {
