@@ -19,7 +19,9 @@ import java.util.Base64
 class HostTrustRequired(val fingerprint: String) : Exception("SSH host key approval is required")
 class HostIdentityChanged(val expected: String, val observed: String) : Exception("SSH host identity changed")
 class SshAuthenticationFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
-class SshConnectionFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
+open class SshConnectionFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
+class SshAlgorithmNegotiationFailed(message: String, cause: Throwable? = null) :
+    SshConnectionFailed(message, cause)
 
 data class ExecResult(val exitCode: Int, val stdout: String, val stderr: String)
 
@@ -27,6 +29,16 @@ class SshTransport(
     private val connectTimeoutMs: Int = 10_000,
     private val channelTimeoutMs: Int = 15_000,
 ) {
+    companion object {
+        /*
+         * Android's runtime crypto providers are not equivalent to the Java 17
+         * toolchain used to compile the app.  mwiede/JSch supports Ed25519 on
+         * older/non-OpenJDK runtimes through Bouncy Castle, so force that
+         * implementation for the algorithm used by the R1 Dropbear host key.
+         */
+        private const val ED25519_SIGNATURE_IMPL = "com.jcraft.jsch.bc.SignatureEd25519"
+    }
+
     private class RejectingUserInfo : UserInfo {
         override fun getPassphrase(): String? = null
         override fun getPassword(): String? = null
@@ -69,6 +81,7 @@ class SshTransport(
         session.userInfo = RejectingUserInfo()
         session.setConfig("StrictHostKeyChecking", "ask")
         session.setConfig("PreferredAuthentications", "password")
+        session.setConfig("ssh-ed25519", ED25519_SIGNATURE_IMPL)
         session.setServerAliveInterval(15_000)
         session.setServerAliveCountMax(2)
         try {
@@ -82,6 +95,13 @@ class SshTransport(
                 throw HostIdentityChanged(profile.hostFingerprint, observed)
             }
             val message = error.message.orEmpty()
+            if (isAlgorithmNegotiationFailure(message)) {
+                throw SshAlgorithmNegotiationFailed(
+                    "The HiBy R1 was reached, but the SSH host-key algorithms could not be negotiated. " +
+                        "R1 Manager 0.1.1 includes ssh-ed25519 support for the R1 Dropbear host key.",
+                    error,
+                )
+            }
             if (message.contains("Auth fail", ignoreCase = true) ||
                 message.contains("authentication", ignoreCase = true)) {
                 throw SshAuthenticationFailed("The HiBy R1 rejected the username or password.", error)
@@ -89,6 +109,11 @@ class SshTransport(
             throw SshConnectionFailed(message.ifBlank { "The HiBy R1 could not be reached." }, error)
         }
     }
+
+    private fun isAlgorithmNegotiationFailure(message: String): Boolean =
+        message.contains("Algorithm negotiation fail", ignoreCase = true) ||
+            message.contains("algorithmName=\"server_host_key\"", ignoreCase = true) ||
+            message.contains("algorithmName='server_host_key'", ignoreCase = true)
 
     fun exec(profile: R1Profile, command: String): ExecResult {
         val session = connect(profile)
