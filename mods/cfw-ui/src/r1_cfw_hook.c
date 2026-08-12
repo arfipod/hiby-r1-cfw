@@ -74,6 +74,19 @@ typedef int (*ioctl_function_t)(int, unsigned long, ...);
 static volatile uint32_t *const callback_slot =
     (volatile uint32_t *)R1_PLAYER_CALLBACK_ADDRESS;
 static volatile int callback_active;
+
+struct virtual_display_state {
+    atomic_flag lock;
+    int active;
+    uint32_t yoffset;
+    uint32_t yres;
+    uint32_t yres_virtual;
+    uint64_t suppressed_pans;
+};
+
+static struct virtual_display_state virtual_display = {
+    .lock = ATOMIC_FLAG_INIT,
+};
 static uint32_t installed_callback;
 static int hook_installed;
 static _Atomic(void *) next_ioctl_address;
@@ -122,16 +135,149 @@ __attribute__((visibility("default")))
 int r1_cfw_ioctl(int descriptor, unsigned long request, uintptr_t argument)
     __asm__("ioctl");
 
+static void virtual_display_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&virtual_display.lock,
+                                             memory_order_acquire)) {
+        /* The critical sections contain scalar state and one fbdev ioctl. */
+    }
+}
+
+static void virtual_display_unlock(void) {
+    atomic_flag_clear_explicit(&virtual_display.lock, memory_order_release);
+}
+
+static void virtual_display_begin(const struct fb_var_screeninfo *variable) {
+    virtual_display_lock();
+    virtual_display.yoffset = variable->yoffset;
+    virtual_display.yres = variable->yres;
+    virtual_display.yres_virtual = variable->yres_virtual;
+    virtual_display.suppressed_pans = 0;
+    virtual_display.active = 1;
+    virtual_display_unlock();
+}
+
+static uint32_t virtual_display_finish(int descriptor,
+                                       struct fb_var_screeninfo *variable) {
+    uint32_t yoffset;
+    virtual_display_lock();
+    yoffset = virtual_display.active ? virtual_display.yoffset
+                                     : variable->yoffset;
+    variable->yoffset = yoffset;
+    /* Keep virtual state live through the restoring pan. A stock rendering
+     * thread that reaches ioctl concurrently waits here, then sees inactive
+     * state and forwards its newer request normally. */
+    (void)forward_ioctl(descriptor, FBIOPAN_DISPLAY, (uintptr_t)variable);
+    virtual_display.active = 0;
+    virtual_display_unlock();
+    return yoffset;
+}
+
+static int virtual_display_ioctl(int descriptor, unsigned long request,
+                                 uintptr_t argument, int *handled) {
+    int result;
+    *handled = 0;
+    virtual_display_lock();
+    if (!virtual_display.active) {
+        virtual_display_unlock();
+        return 0;
+    }
+    if (request == (unsigned long)FBIOPAN_DISPLAY) {
+        struct fb_var_screeninfo requested;
+        uint32_t maximum;
+        *handled = 1;
+        if (!argument) {
+            virtual_display_unlock();
+            errno = EFAULT;
+            return -1;
+        }
+        memcpy(&requested, (const void *)argument, sizeof(requested));
+        maximum = virtual_display.yres_virtual > virtual_display.yres
+                      ? virtual_display.yres_virtual - virtual_display.yres
+                      : 0U;
+        if (requested.yoffset > maximum) {
+            virtual_display_unlock();
+            errno = EINVAL;
+            return -1;
+        }
+        virtual_display.yoffset = requested.yoffset;
+        ++virtual_display.suppressed_pans;
+        virtual_display_unlock();
+        return 0;
+    }
+    if (request == (unsigned long)FBIOGET_VSCREENINFO) {
+        *handled = 1;
+        result = forward_ioctl(descriptor, request, argument);
+        if (result == 0 && argument) {
+            struct fb_var_screeninfo *reported = (void *)argument;
+            reported->yoffset = virtual_display.yoffset;
+        }
+        virtual_display_unlock();
+        return result;
+    }
+    virtual_display_unlock();
+    return 0;
+}
+
 __attribute__((visibility("default")))
 int r1_cfw_ioctl(int descriptor, unsigned long request, uintptr_t argument) {
-    if (request == (unsigned long)FBIOPAN_DISPLAY && callback_active) return 0;
-    return forward_ioctl(descriptor, request, argument);
+    int handled;
+    int result = virtual_display_ioctl(descriptor, request, argument, &handled);
+    return handled ? result : forward_ioctl(descriptor, request, argument);
 }
 
 #ifdef R1_CFW_HOOK_TEST
 __attribute__((visibility("default")))
 void r1_cfw_test_set_callback_active(int active) {
+    struct fb_var_screeninfo variable;
+    memset(&variable, 0, sizeof(variable));
+    variable.yres = 800;
+    variable.yres_virtual = 1600;
     callback_active = active ? 1 : 0;
+    if (active)
+        virtual_display_begin(&variable);
+    else {
+        virtual_display_lock();
+        virtual_display.active = 0;
+        virtual_display_unlock();
+    }
+}
+
+__attribute__((visibility("default")))
+void r1_cfw_test_begin_virtual_display(uint32_t yoffset, uint32_t yres,
+                                       uint32_t yres_virtual) {
+    struct fb_var_screeninfo variable;
+    memset(&variable, 0, sizeof(variable));
+    variable.yoffset = yoffset;
+    variable.yres = yres;
+    variable.yres_virtual = yres_virtual;
+    virtual_display_begin(&variable);
+}
+
+__attribute__((visibility("default")))
+int r1_cfw_test_virtual_display_active(void) {
+    int active;
+    virtual_display_lock();
+    active = virtual_display.active;
+    virtual_display_unlock();
+    return active;
+}
+
+__attribute__((visibility("default")))
+uint32_t r1_cfw_test_virtual_yoffset(void) {
+    uint32_t yoffset;
+    virtual_display_lock();
+    yoffset = virtual_display.yoffset;
+    virtual_display_unlock();
+    return yoffset;
+}
+
+__attribute__((visibility("default")))
+uint64_t r1_cfw_test_suppressed_pans(void) {
+    uint64_t count;
+    virtual_display_lock();
+    count = virtual_display.suppressed_pans;
+    virtual_display_unlock();
+    return count;
 }
 
 __attribute__((visibility("default")))
@@ -437,11 +583,10 @@ static void restore_framebuffer(int descriptor,
         struct fb_var_screeninfo variable = snapshot->variable;
         memcpy(snapshot->mapping, snapshot->copy, snapshot->bytes);
         (void)msync(snapshot->mapping, snapshot->bytes, MS_SYNC);
-        variable.yoffset = snapshot->variable.yoffset;
-        /* callback_active intentionally remains set until cleanup finishes,
-         * so stock rendering threads cannot race this final restoration. */
-        (void)forward_ioctl(descriptor, FBIOPAN_DISPLAY,
-                            (uintptr_t)&variable);
+        /* hiby_player keeps rendering on other threads while the sidecar owns
+         * the visible display. Reconcile fb0 with the last page flip that the
+         * player was told had succeeded, rather than the entry-time page. */
+        (void)virtual_display_finish(descriptor, &variable);
     }
 }
 
@@ -578,6 +723,7 @@ static int cfw_callback(void *argument0, void *argument1) {
     framebuffer = open("/dev/fb0", O_RDWR | O_CLOEXEC);
     if (framebuffer < 0) goto cleanup;
     if (capture_framebuffer(framebuffer, &snapshot) < 0) goto cleanup;
+    virtual_display_begin(&snapshot.variable);
     if (acquire_touch(&touch) < 0) goto restore;
     child_framebuffer = duplicate_for_exec(framebuffer);
     if (child_framebuffer < 0) {

@@ -207,12 +207,52 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
                 #define _GNU_SOURCE
                 #include <dlfcn.h>
                 #include <fcntl.h>
+                #include <linux/fb.h>
+                #include <pthread.h>
                 #include <stdint.h>
                 #include <string.h>
+                #include <sys/ioctl.h>
                 #include <sys/mman.h>
+                #include <time.h>
                 #include <unistd.h>
 
                 typedef int (*callback_t)(void);
+                typedef int (*display_active_t)(void);
+
+                struct pan_probe {
+                    int framebuffer_fd;
+                    int pan_result;
+                    int get_result;
+                    uint32_t reported_yoffset;
+                    int saw_active;
+                };
+
+                static void *pan_during_sidecar(void *opaque) {
+                    struct pan_probe *probe = opaque;
+                    display_active_t active = (display_active_t)dlsym(
+                        RTLD_DEFAULT, "r1_cfw_test_virtual_display_active");
+                    struct fb_var_screeninfo variable;
+                    struct timespec delay = {0, 1000000};
+                    unsigned attempt;
+                    if (!active) return NULL;
+                    for (attempt = 0; attempt < 500U; ++attempt) {
+                        if (active()) {
+                            probe->saw_active = 1;
+                            break;
+                        }
+                        nanosleep(&delay, NULL);
+                    }
+                    if (!probe->saw_active) return NULL;
+                    memset(&variable, 0, sizeof(variable));
+                    variable.yoffset = 800U;
+                    probe->pan_result = ioctl(probe->framebuffer_fd,
+                                              FBIOPAN_DISPLAY, &variable);
+                    memset(&variable, 0, sizeof(variable));
+                    probe->get_result = ioctl(probe->framebuffer_fd,
+                                              FBIOGET_VSCREENINFO, &variable);
+                    probe->reported_yoffset = variable.yoffset;
+                    return NULL;
+                }
 
                 struct r1_dma_descriptor {
                     uint32_t source_offset;
@@ -238,8 +278,10 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
                     int framebuffer_fd;
                     int dma_fd;
                     unsigned lifecycle;
+                    pthread_t pan_thread;
+                    struct pan_probe pan = {-1, -99, -99, 0U, 0};
+                    struct fb_var_screeninfo final_variable;
                     if (!callback) return 96;
-                    if (sysconf(_SC_OPEN_MAX) <= 65536L) return 107;
                     framebuffer_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
                     if (framebuffer_fd < 0) return 99;
                     framebuffer = mmap(NULL, framebuffer_bytes,
@@ -253,8 +295,19 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
                                MAP_SHARED, dma_fd, 0);
                     if (dma == MAP_FAILED) return 102;
                     memset(dma, 0xa5, transfer.line_bytes);
+                    pan.framebuffer_fd = framebuffer_fd;
+                    if (pthread_create(&pan_thread, NULL, pan_during_sidecar,
+                                       &pan) != 0) return 108;
                     for (lifecycle = 0; lifecycle < 8U; ++lifecycle)
                         if (callback() != 0) return 97;
+                    if (pthread_join(pan_thread, NULL) != 0) return 109;
+                    if (!pan.saw_active || pan.pan_result != 0 ||
+                        pan.get_result != 0 || pan.reported_yoffset != 800U)
+                        return 110;
+                    memset(&final_variable, 0, sizeof(final_variable));
+                    if (ioctl(framebuffer_fd, FBIOGET_VSCREENINFO,
+                              &final_variable) != 0 ||
+                        final_variable.yoffset != 800U) return 111;
                     if (memcmp(framebuffer, preserved, sizeof(preserved)) != 0)
                         return 106;
                     if (write(dma_fd, &transfer, sizeof(transfer)) !=
@@ -362,7 +415,10 @@ class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):
             timeout=30,
         )
         subprocess.run(
-            [*target, str(callback_probe_source), "-ldl", "-o", str(cls.callback_probe)],
+            [
+                *target, str(callback_probe_source), "-ldl", "-pthread",
+                "-o", str(cls.callback_probe),
+            ],
             check=True,
             cwd=REPO_ROOT,
             env=cache_environment,

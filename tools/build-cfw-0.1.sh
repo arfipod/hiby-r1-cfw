@@ -40,6 +40,8 @@ check_dir=$work_dir/check
 check_root=$work_dir/check-rootfs
 ui_build=$work_dir/ui-build
 ui_verify_build=$work_dir/ui-verify-build
+filectl_build=$work_dir/filectl-build
+filectl_verify_build=$work_dir/filectl-verify-build
 retro_theme_work=$work_dir/retro-theme
 retro_verify_work=$work_dir/retro-theme-verify
 retro_expected_paths=$work_dir/retro-theme-expected-paths.txt
@@ -101,7 +103,9 @@ require_build_inputs() {
         "$repo_dir/tools/retro_theme_assets.py" \
         "$repo_dir/tools/retro_theme_package.py" \
         "$repo_dir/tools/retro_theme_integration.py" \
-        "$repo_dir/tools/genisoimage_compat.py"
+        "$repo_dir/tools/genisoimage_compat.py" \
+        "$repo_dir/tools/build-r1-filectl.sh" \
+        "$repo_dir/mods/r1-filectl/src/r1_filectl.c"
     do
         if [ ! -f "$required" ]; then
             echo "missing Retro Handheld build input: $required" >&2
@@ -133,6 +137,7 @@ strict_rootfs_diff() {
         --expect-added etc/init.d/S91dropbear \
         --expect-added usr/bin/dropbearkey \
         --expect-added usr/bin/r1-cfw-ui \
+        --expect-added usr/bin/r1-filectl \
         --expect-added usr/bin/r1-ssh-control \
         --expect-added usr/bin/scp \
         --expect-added usr/lib/libr1-cfw-hook.so \
@@ -208,11 +213,13 @@ verify_overlay_payloads() {
     cmp "$cfw_overlay/etc/init.d/S90r1-cfw" "$check_root/etc/init.d/S90r1-cfw"
     cmp "$ui_verify_build/r1-cfw-ui" "$check_root/usr/bin/r1-cfw-ui"
     cmp "$ui_verify_build/libr1-cfw-hook.so" "$check_root/usr/lib/libr1-cfw-hook.so"
+    cmp "$filectl_verify_build/r1-filectl" "$check_root/usr/bin/r1-filectl"
     require_mode 755 "$check_root/etc/init.d/S90r1-cfw"
     require_mode 755 "$check_root/etc/init.d/S91dropbear"
     require_mode 600 "$check_root/etc/shadow"
     require_mode 700 "$check_root/root/.ssh"
     require_mode 755 "$check_root/usr/bin/r1-cfw-ui"
+    require_mode 755 "$check_root/usr/bin/r1-filectl"
     require_mode 755 "$check_root/usr/bin/r1-ssh-control"
     require_mode 755 "$check_root/usr/lib/libr1-cfw-hook.so"
     require_mode 755 "$check_root/usr/sbin/dropbearmulti"
@@ -243,6 +250,7 @@ verify_candidate() {
     candidate_upt_sha256=$(sha256sum "$verified_candidate" | awk '{print $1}')
 
     "$repo_dir/tools/build-r1-cfw-ui.sh" "$ui_verify_build"
+    "$repo_dir/tools/build-r1-filectl.sh" "$filectl_verify_build"
 
     python3 "$repo_dir/tools/r1fw.py" unpack "$firmware" "$stock_unpack" --force
     python3 "$repo_dir/tools/r1fw.py" extract-rootfs \
@@ -288,6 +296,7 @@ prepare_candidate() {
     python3 "$repo_dir/tools/r1fw.py" apply-overlay "$root" "$ssh_overlay"
     python3 "$repo_dir/tools/r1fw.py" apply-overlay "$root" "$cfw_overlay"
     "$repo_dir/tools/build-r1-cfw-ui.sh" "$ui_build"
+    "$repo_dir/tools/build-r1-filectl.sh" "$filectl_build"
 
     install -m 0755 "$dropbear" "$root/usr/sbin/dropbearmulti"
     ln -sf dropbearmulti "$root/usr/sbin/dropbear"
@@ -296,6 +305,7 @@ prepare_candidate() {
     install -m 0755 "$ui_build/r1-cfw-ui" "$root/usr/bin/r1-cfw-ui"
     install -m 0755 "$ui_build/libr1-cfw-hook.so" \
         "$root/usr/lib/libr1-cfw-hook.so"
+    install -m 0755 "$filectl_build/r1-filectl" "$root/usr/bin/r1-filectl"
     chmod 0700 "$root/root/.ssh"
     chmod 0600 "$root/etc/shadow"
 
