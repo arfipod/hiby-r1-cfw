@@ -117,6 +117,15 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertLess(prepare.index(needle), build)
 
+        # Retro is generated from the finalized stock light/dark trees. The
+        # CFW launcher icons carry the stock resource mode (0664), so they must
+        # exist before Retro copies/transforms those trees or deterministic
+        # verification will see identical PNG bytes with different modes.
+        self.assertLess(
+            prepare.index('patch_r1_launcher.py" generate "$root"'),
+            prepare.index('"$retro_theme_tool" generate "$root"'),
+        )
+
     def test_verification_reextracts_and_checks_kernel_payload_and_patches(self) -> None:
         start = self.script.index("verify_candidate()")
         finish = self.script.index("prepare_candidate()")

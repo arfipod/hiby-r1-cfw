@@ -312,8 +312,12 @@ prepare_candidate() {
     python3 "$repo_dir/tools/patch_r1_branding.py" "$root"
     python3 "$repo_dir/tools/patch_r1_ssh_toggle.py" apply "$root"
     python3 "$repo_dir/tools/patch_r1_cfw_integration.py" "$root"
-    python3 "$retro_theme_tool" generate "$root" "$retro_theme_work"
+    # Generate the stock CFW launcher assets first. Retro Handheld is derived
+    # from the finalized light/dark resource trees, so installing it before
+    # these 0664 CFW icons would make verification regenerate the same PNG
+    # bytes with different modes after candidate re-extraction.
     python3 "$repo_dir/tools/patch_r1_launcher.py" generate "$root"
+    python3 "$retro_theme_tool" generate "$root" "$retro_theme_work"
     python3 "$retro_launcher_tool" generate "$root"
 
     python3 "$repo_dir/tools/r1fw.py" build-rootfs "$root" "$rootfs_image" --force
