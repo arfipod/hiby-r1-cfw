@@ -1,0 +1,51 @@
+name: Bootstrap development kit
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/bootstrap-kit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install firmware tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            genisoimage qemu-user squashfs-tools xz-utils
+
+      - name: Bootstrap pinned project toolchain
+        run: tools/bootstrap-ssh-toolchain.sh
+
+      - name: Package repository and host tools
+        run: |
+          set -eux
+          mkdir -p bootstrap-kit/bin bootstrap-kit/project
+          cp "$(command -v genisoimage)" bootstrap-kit/bin/
+          cp "$(command -v mksquashfs)" bootstrap-kit/bin/
+          cp "$(command -v unsquashfs)" bootstrap-kit/bin/
+          cp "$(command -v qemu-mipsel)" bootstrap-kit/bin/
+          tar --exclude=.git --exclude=work --exclude=bootstrap-kit \
+            -czf bootstrap-kit/project/repository.tar.gz .
+          tar -C work -cJf bootstrap-kit/project/pinned-toolchain.tar.xz \
+            host-tools ssh-build/src
+          sha256sum bootstrap-kit/bin/* bootstrap-kit/project/* \
+            > bootstrap-kit/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r1-development-kit
+          path: bootstrap-kit
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
