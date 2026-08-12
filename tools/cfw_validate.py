@@ -541,9 +541,21 @@ class QemuSession:
                 last_text = ""
             if PLAYER_READY_MARKER in last_text:
                 return
+            # The vendor player writes its readiness printf through buffered
+            # stdio under qemu-user, so a non-TTY validation run can render
+            # the launcher without flushing that diagnostic line. The fbdev
+            # shim sequence is a stronger runtime signal: three completed
+            # presents mean the real player reached its UI render loop.
+            try:
+                _yoffset, sequence = nav.read_frame_state(self.frame_state)
+                if sequence >= 3:
+                    return
+            except (OSError, RuntimeError, ValueError):
+                pass
             time.sleep(0.05)
         raise ValidationError(
-            f"session {self.name} did not reach the player readiness marker; "
+            f"session {self.name} did not reach the player readiness marker "
+            "or render-loop fallback; "
             f"log_tail={last_text[-500:]!r}"
         )
 
