@@ -22,6 +22,7 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
             ("600", "etc/shadow"),
             ("700", "root/.ssh"),
             ("755", "usr/bin/r1-cfw-ui"),
+            ("755", "usr/bin/r1-filectl"),
             ("755", "usr/lib/libr1-cfw-hook.so"),
             ("755", "usr/sbin/dropbearmulti"),
         ):
@@ -106,6 +107,7 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
             'apply-overlay "$root" "$ssh_overlay"',
             'apply-overlay "$root" "$cfw_overlay"',
             'build-r1-cfw-ui.sh"',
+            'build-r1-filectl.sh"',
             'patch_r1_branding.py" "$root"',
             'patch_r1_ssh_toggle.py" apply "$root"',
             'patch_r1_launcher.py" generate "$root"',
@@ -129,6 +131,7 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
         self.assertIn('patch_r1_launcher.py" verify "$check_root"', verify)
         self.assertIn('patch_r1_cfw_integration.py" "$check_root" --check', verify)
         self.assertIn('build-r1-cfw-ui.sh" "$ui_verify_build"', verify)
+        self.assertIn('build-r1-filectl.sh" "$filectl_verify_build"', verify)
         self.assertIn(
             'cmp "$ui_verify_build/r1-cfw-ui" "$check_root/usr/bin/r1-cfw-ui"',
             self.script,
@@ -137,6 +140,11 @@ class Cfw01BuildPipelineTests(unittest.TestCase):
             'cmp "$ui_verify_build/libr1-cfw-hook.so" "$check_root/usr/lib/libr1-cfw-hook.so"',
             self.script,
         )
+        self.assertIn(
+            'cmp "$filectl_verify_build/r1-filectl" "$check_root/usr/bin/r1-filectl"',
+            self.script,
+        )
+        self.assertIn('--expect-added usr/bin/r1-filectl', self.script)
         self.assertIn("strict_rootfs_diff", verify)
 
     def test_strict_allowlist_has_all_launcher_variants_and_language_changes(self) -> None:

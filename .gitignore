@@ -4,3 +4,10 @@ artifacts/
 test-audio.mp3
 __pycache__/
 *.py[cod]
+
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab

@@ -715,7 +715,7 @@ class R1CFWUITests(unittest.TestCase):
             ).stdout
             self.assertRegex(hook_symbols, r"(?m)GLOBAL\s+DEFAULT\s+\d+ ioctl$")
 
-    def test_hook_ioctl_interposer_chains_suppresses_and_allows_restore(self) -> None:
+    def test_hook_ioctl_interposer_virtualizes_page_state_and_allows_restore(self) -> None:
         compiler = shutil.which("cc")
         if not compiler:
             self.skipTest("a host C compiler is unavailable")
@@ -731,6 +731,9 @@ class R1CFWUITests(unittest.TestCase):
                     r"""
                     #include <linux/fb.h>
                     #include <stdint.h>
+                    #include <string.h>
+
+                    static uint32_t physical_yoffset;
 
                     __attribute__((visibility("default")))
                     int test_next_ioctl(int descriptor, unsigned long request,
@@ -739,11 +742,23 @@ class R1CFWUITests(unittest.TestCase):
                     __attribute__((visibility("default")))
                     int test_next_ioctl(int descriptor, unsigned long request,
                                         uintptr_t argument) {
+                        struct fb_var_screeninfo *variable = (void *)argument;
                         if (descriptor != 9) return -90;
                         if (request == 0x12345678UL &&
                             argument == (uintptr_t)0xabcdef01UL) return 66;
+                        if (request == (unsigned long)FBIOGET_VSCREENINFO &&
+                            variable) {
+                            memset(variable, 0, sizeof(*variable));
+                            variable->yres = 800;
+                            variable->yres_virtual = 1600;
+                            variable->yoffset = physical_yoffset;
+                            return 0;
+                        }
                         if (request == (unsigned long)FBIOPAN_DISPLAY &&
-                            argument != 0) return 77;
+                            variable) {
+                            physical_yoffset = variable->yoffset;
+                            return 77;
+                        }
                         return -91;
                     }
                     """
@@ -755,34 +770,67 @@ class R1CFWUITests(unittest.TestCase):
                     r"""
                     #define _GNU_SOURCE
                     #include <dlfcn.h>
+                    #include <errno.h>
                     #include <linux/fb.h>
                     #include <stdint.h>
                     #include <stdio.h>
                     #include <sys/ioctl.h>
 
-                    typedef void (*set_active_t)(int);
+                    typedef void (*begin_t)(uint32_t, uint32_t, uint32_t);
+                    typedef uint32_t (*yoffset_t)(void);
+                    typedef uint64_t (*count_t)(void);
                     typedef int (*unfiltered_t)(int, unsigned long, uintptr_t);
 
                     int main(void) {
-                        struct fb_var_screeninfo variable = {0};
-                        set_active_t set_active =
-                            (set_active_t)dlsym(RTLD_DEFAULT,
-                                                "r1_cfw_test_set_callback_active");
-                        unfiltered_t unfiltered =
-                            (unfiltered_t)dlsym(RTLD_DEFAULT,
-                                                "r1_cfw_test_unfiltered_ioctl");
+                        struct fb_var_screeninfo requested = {0};
+                        struct fb_var_screeninfo virtual_report = {0};
+                        struct fb_var_screeninfo physical_report = {0};
+                        begin_t begin = (begin_t)dlsym(
+                            RTLD_DEFAULT, "r1_cfw_test_begin_virtual_display");
+                        yoffset_t yoffset = (yoffset_t)dlsym(
+                            RTLD_DEFAULT, "r1_cfw_test_virtual_yoffset");
+                        count_t count = (count_t)dlsym(
+                            RTLD_DEFAULT, "r1_cfw_test_suppressed_pans");
+                        unfiltered_t unfiltered = (unfiltered_t)dlsym(
+                            RTLD_DEFAULT, "r1_cfw_test_unfiltered_ioctl");
                         int forwarded;
                         int suppressed;
+                        int virtual_get;
+                        int physical_get;
+                        int invalid;
+                        int invalid_errno;
                         int restored;
-                        if (!set_active || !unfiltered) return 2;
+                        if (!begin || !yoffset || !count || !unfiltered) return 2;
                         forwarded = ioctl(9, 0x12345678UL,
                                           (uintptr_t)0xabcdef01UL);
-                        set_active(1);
-                        suppressed = ioctl(9, FBIOPAN_DISPLAY, &variable);
+                        begin(0, 800, 1600);
+                        requested.yoffset = 800;
+                        suppressed = ioctl(9, FBIOPAN_DISPLAY, &requested);
+                        virtual_get = ioctl(9, FBIOGET_VSCREENINFO,
+                                            &virtual_report);
+                        physical_get = unfiltered(
+                            9, FBIOGET_VSCREENINFO,
+                            (uintptr_t)&physical_report);
+                        requested.yoffset = 801;
+                        errno = 0;
+                        invalid = ioctl(9, FBIOPAN_DISPLAY, &requested);
+                        invalid_errno = errno;
+                        requested.yoffset = 800;
                         restored = unfiltered(9, FBIOPAN_DISPLAY,
-                                              (uintptr_t)&variable);
-                        printf("%d %d %d\n", forwarded, suppressed, restored);
+                                              (uintptr_t)&requested);
+                        printf("%d %d %d %u %d %u %u %llu %d %d %d\n",
+                               forwarded, suppressed, virtual_get,
+                               virtual_report.yoffset, physical_get,
+                               physical_report.yoffset, yoffset(),
+                               (unsigned long long)count(), invalid,
+                               invalid_errno, restored);
                         return forwarded == 66 && suppressed == 0 &&
+                                       virtual_get == 0 &&
+                                       virtual_report.yoffset == 800 &&
+                                       physical_get == 0 &&
+                                       physical_report.yoffset == 0 &&
+                                       yoffset() == 800 && count() == 1 &&
+                                       invalid == -1 && invalid_errno == EINVAL &&
                                        restored == 77
                                    ? 0
                                    : 1;
@@ -793,50 +841,27 @@ class R1CFWUITests(unittest.TestCase):
             )
             flags = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
             subprocess.run(
-                [
-                    compiler,
-                    *flags,
-                    "-shared",
-                    "-fPIC",
-                    "-DR1_CFW_HOOK_TEST",
-                    str(SOURCE_DIR / "r1_cfw_hook.c"),
-                    "-ldl",
-                    "-o",
-                    str(hook),
-                ],
-                check=True,
-                cwd=REPO_ROOT,
+                [compiler, *flags, "-shared", "-fPIC", "-DR1_CFW_HOOK_TEST",
+                 str(SOURCE_DIR / "r1_cfw_hook.c"), "-ldl", "-o", str(hook)],
+                check=True, cwd=REPO_ROOT,
             )
             subprocess.run(
-                [
-                    compiler,
-                    *flags,
-                    "-shared",
-                    "-fPIC",
-                    str(next_source),
-                    "-o",
-                    str(next_layer),
-                ],
-                check=True,
-                cwd=REPO_ROOT,
+                [compiler, *flags, "-shared", "-fPIC", str(next_source),
+                 "-o", str(next_layer)],
+                check=True, cwd=REPO_ROOT,
             )
             subprocess.run(
                 [compiler, *flags, str(probe_source), "-ldl", "-o", str(probe)],
-                check=True,
-                cwd=REPO_ROOT,
+                check=True, cwd=REPO_ROOT,
             )
             environment = os.environ.copy()
             environment["LD_PRELOAD"] = f"{hook}:{next_layer}"
             result = subprocess.run(
-                [str(probe)],
-                check=False,
-                text=True,
-                capture_output=True,
-                env=environment,
-                timeout=5,
+                [str(probe)], check=False, text=True, capture_output=True,
+                env=environment, timeout=5,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("66 0 77\n", result.stdout)
+            self.assertEqual("66 0 0 800 0 0 800 1 -1 22 77\n", result.stdout)
 
     def test_hook_scans_for_the_named_touchscreen_and_guards_stock_addresses(self) -> None:
         source = (SOURCE_DIR / "r1_cfw_hook.c").read_text(encoding="utf-8")
