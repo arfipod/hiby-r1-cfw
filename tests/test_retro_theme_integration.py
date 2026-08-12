@@ -93,8 +93,8 @@ class RetroThemeIntegrationTests(unittest.TestCase):
         self.assertIn("for theme in theme1 theme2 midi-theme1 retro", source)
         self.assertIn("expected-paths", source)
         self.assertLess(
-            source.index('"$retro_theme_tool" generate'),
             source.index('patch_r1_launcher.py" generate'),
+            source.index('"$retro_theme_tool" generate'),
         )
 
 
