@@ -28,8 +28,15 @@ jobs:
             | xz --decompress \
             > /tmp/r1-suite.patch
           git apply --binary --index /tmp/r1-suite.patch
+
+          # A repository GITHUB_TOKEN may not create, update, or delete workflow
+          # files. Keep the current workflow tree byte-for-byte unchanged for
+          # this product commit; the connected GitHub app applies those three
+          # workflow mutations explicitly after the push succeeds.
+          git restore --source=HEAD --staged --worktree .github/workflows
+
           rm -rf .github/r1-suite-patch
-          rm -f .github/workflows/apply-r1-suite.yml
+          git add -A .github/r1-suite-patch
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Add R1 Manager, secure file control, and framebuffer handoff fix"
