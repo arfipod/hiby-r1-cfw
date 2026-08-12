@@ -21,7 +21,8 @@ jobs:
       - name: Install validator host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends bubblewrap openssh-client
+          sudo apt-get install --no-install-recommends \
+            bubblewrap openssh-client qemu-user-static
 
       - name: Build relocatable host-tool bundle
         run: |
@@ -34,6 +35,7 @@ jobs:
           while IFS= read -r library; do
             cp -L "$library" "validation-tools/lib/$(basename "$library")"
           done < validation-tools/ldd-paths.txt
+          cp -L /usr/bin/qemu-mipsel-static validation-tools/bin/qemu-mipsel-static
           cat > validation-tools/bin/bwrap <<'EOF'
           #!/bin/sh
           here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -50,7 +52,9 @@ jobs:
           LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/bin/ssh-keygen.real" "$@"
           EOF
           chmod 0755 validation-tools/bin/*
-          sha256sum validation-tools/bin/*.real validation-tools/lib/* > validation-tools/SHA256SUMS
+          sha256sum validation-tools/bin/*.real validation-tools/bin/qemu-mipsel-static \
+            validation-tools/lib/* > validation-tools/SHA256SUMS
+          file validation-tools/bin/qemu-mipsel-static
 
       - uses: actions/upload-artifact@v4
         with:
