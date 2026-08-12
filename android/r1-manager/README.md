@@ -51,10 +51,12 @@ cd android/r1-manager
 gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 ```
 
+Every CI build runs JVM unit tests and Android lint before assembling the APK.
 GitHub Actions publishes the signed, installable debug APK as the
-`r1-manager-debug-apk` workflow artifact. The intended physical target is an
-HONOR Magic5 Pro running Android 16 / MagicOS 10, while the app uses standard
-Android storage, networking and Keystore APIs rather than vendor-specific APIs.
+`r1-manager-debug-apk` workflow artifact and keeps the lint/test reports in a
+separate diagnostic artifact. The intended physical target is an HONOR Magic5
+Pro running Android 16 / MagicOS 10, while the app uses standard Android
+storage, networking and Keystore APIs rather than vendor-specific APIs.
 
 ## Security model
 
