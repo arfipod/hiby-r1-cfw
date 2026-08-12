@@ -1,0 +1,33 @@
+name: Apply Android compile fix
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/apply-android-compile-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/r1-connectivity-suite
+          fetch-depth: 0
+
+      - name: Apply and commit source fix
+        run: |
+          set -eux
+          git apply --index .github/android-compile-fix.patch
+          git restore --source=HEAD --staged --worktree .github/workflows
+          rm .github/android-compile-fix.patch
+          git add -A .github/android-compile-fix.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Fix Compose navigation scope compilation"
+          git push origin HEAD:agent/r1-connectivity-suite
