@@ -50,6 +50,40 @@ class RenderReadinessTests(unittest.TestCase):
                 with self.assertRaisesRegex(validation.ValidationError, "readiness"):
                     session.wait_player_ready()
 
+    def test_start_discards_previous_session_frame_state_before_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = validation.Evidence(root / "artifacts", "restart-state")
+            session = validation.QemuSession(
+                name="restart",
+                runner=root / "runner",
+                rootfs=root / "rootfs",
+                profile=root / "profile",
+                runtime=root / "runtime",
+                sd_present=True,
+                evidence=evidence,
+                boot_timeout=0.08,
+                transition_timeout=0.05,
+            )
+            session.runtime.mkdir(parents=True)
+            session.frame_state.write_bytes(b"stale previous process telemetry")
+            observed = []
+
+            def fake_popen(*_args, **_kwargs):
+                observed.append(session.frame_state.exists())
+                return SimpleNamespace(poll=lambda: None)
+
+            with mock.patch.object(validation.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(session, "wait_player_ready"), \
+                mock.patch.object(session, "wait_stable_frame", return_value="ready"):
+                self.assertEqual("ready", session.start())
+
+            self.assertEqual([False], observed)
+            session.process = None
+            if session.log_stream is not None:
+                session.log_stream.close()
+                session.log_stream = None
+
 
 if __name__ == "__main__":
     unittest.main()
