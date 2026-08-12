@@ -1,4 +1,4 @@
-name: Export latest exact main source snapshot
+name: Export QEMU validation host helper
 
 on:
   push:
@@ -15,25 +15,22 @@ jobs:
   export:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 1
-      - name: Verify exact merged main tree
+      - name: Locate bubblewrap
         run: |
           set -eux
-          test "$(git rev-parse HEAD)" = "6c1862132316a3a3a4eeb9cd414e6bdb94a8638c"
-          test "$(git rev-parse HEAD^{tree})" = "f32b20b16b772ff918854469136de7a634b784a9"
-      - name: Package source
-        run: |
-          set -eux
-          mkdir -p snapshot
-          tar --exclude=.git --exclude=snapshot -czf snapshot/hiby-r1-cfw-main-6c186213.tar.gz .
-          sha256sum snapshot/hiby-r1-cfw-main-6c186213.tar.gz > snapshot/SHA256SUMS
+          if ! command -v bwrap; then
+            sudo apt-get update
+            sudo apt-get install -y bubblewrap
+          fi
+          mkdir -p host-helper
+          cp "$(command -v bwrap)" host-helper/bwrap
+          chmod 0755 host-helper/bwrap
+          file host-helper/bwrap
+          ldd host-helper/bwrap | tee host-helper/ldd.txt
+          sha256sum host-helper/bwrap > host-helper/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: hiby-r1-cfw-main-6c186213
-          path: snapshot
+          name: r1-validation-bwrap-ubuntu2404
+          path: host-helper
           if-no-files-found: error
-          compression-level: 0
           retention-days: 1
