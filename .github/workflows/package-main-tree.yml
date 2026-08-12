@@ -1,0 +1,38 @@
+name: Package verified main tree
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/package-main-tree.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7fed58438654050f3e69bcb5f0fb0f87553e80b0
+          fetch-depth: 1
+
+      - name: Verify exact commit and package
+        run: |
+          set -eux
+          test "$(git rev-parse HEAD)" = "7fed58438654050f3e69bcb5f0fb0f87553e80b0"
+          git archive --format=tar.gz --prefix=hiby-r1-cfw/ HEAD > hiby-r1-cfw-main-7fed584.tar.gz
+          sha256sum hiby-r1-cfw-main-7fed584.tar.gz > hiby-r1-cfw-main-7fed584.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-cfw-main-tree
+          path: |
+            hiby-r1-cfw-main-7fed584.tar.gz
+            hiby-r1-cfw-main-7fed584.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
