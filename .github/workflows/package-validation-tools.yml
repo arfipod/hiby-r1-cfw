@@ -1,0 +1,60 @@
+name: Package QEMU validation host tools
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/package-validation-tools.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validator host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends bubblewrap openssh-client
+
+      - name: Build relocatable host-tool bundle
+        run: |
+          set -eux
+          mkdir -p validation-tools/bin validation-tools/lib
+          for tool in bwrap ssh ssh-keygen; do
+            cp -L "$(command -v "$tool")" "validation-tools/bin/$tool.real"
+            ldd "$(command -v "$tool")" | awk '/=> \/|^\// {for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}'
+          done | sort -u > validation-tools/ldd-paths.txt
+          while IFS= read -r library; do
+            cp -L "$library" "validation-tools/lib/$(basename "$library")"
+          done < validation-tools/ldd-paths.txt
+          cat > validation-tools/bin/bwrap <<'EOF'
+          #!/bin/sh
+          here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/bin/bwrap.real" "$@"
+          EOF
+          cat > validation-tools/bin/ssh <<'EOF'
+          #!/bin/sh
+          here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/bin/ssh.real" "$@"
+          EOF
+          cat > validation-tools/bin/ssh-keygen <<'EOF'
+          #!/bin/sh
+          here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/bin/ssh-keygen.real" "$@"
+          EOF
+          chmod 0755 validation-tools/bin/*
+          sha256sum validation-tools/bin/*.real validation-tools/lib/* > validation-tools/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-validation-host-tools
+          path: validation-tools
+          if-no-files-found: error
+          retention-days: 1
