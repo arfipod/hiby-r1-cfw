@@ -1,0 +1,36 @@
+name: Apply R1 suite patch
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/apply-r1-suite.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/r1-connectivity-suite
+          fetch-depth: 0
+
+      - name: Apply staged implementation
+        run: |
+          set -eux
+          cat .github/r1-suite-patch/part* \
+            | base64 --decode \
+            | xz --decompress \
+            > /tmp/r1-suite.patch
+          git apply --binary --index /tmp/r1-suite.patch
+          rm -rf .github/r1-suite-patch
+          rm -f .github/workflows/apply-r1-suite.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Add R1 Manager, secure file control, and framebuffer handoff fix"
+          git push origin HEAD:agent/r1-connectivity-suite
