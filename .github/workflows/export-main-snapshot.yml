@@ -1,4 +1,4 @@
-name: Export QEMU validation host helper
+name: Export static QEMU validation helper
 
 on:
   push:
@@ -15,22 +15,24 @@ jobs:
   export:
     runs-on: ubuntu-24.04
     steps:
-      - name: Locate bubblewrap
+      - name: Install static MIPS emulator
         run: |
           set -eux
-          if ! command -v bwrap; then
-            sudo apt-get update
-            sudo apt-get install -y bubblewrap
-          fi
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          qemu=$(command -v qemu-mipsel-static)
           mkdir -p host-helper
-          cp "$(command -v bwrap)" host-helper/bwrap
-          chmod 0755 host-helper/bwrap
-          file host-helper/bwrap
-          ldd host-helper/bwrap | tee host-helper/ldd.txt
-          sha256sum host-helper/bwrap > host-helper/SHA256SUMS
+          cp "$qemu" host-helper/qemu-mipsel
+          chmod 0755 host-helper/qemu-mipsel
+          file host-helper/qemu-mipsel
+          if ldd host-helper/qemu-mipsel 2>&1 | grep -vq 'not a dynamic executable'; then
+            echo 'qemu-mipsel is not static' >&2
+            exit 1
+          fi
+          sha256sum host-helper/qemu-mipsel > host-helper/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: r1-validation-bwrap-ubuntu2404
+          name: r1-validation-qemu-mipsel-static-ubuntu2404
           path: host-helper
           if-no-files-found: error
           retention-days: 1
