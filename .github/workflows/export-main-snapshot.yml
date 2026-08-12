@@ -24,11 +24,8 @@ jobs:
           mkdir -p host-helper
           cp "$qemu" host-helper/qemu-mipsel
           chmod 0755 host-helper/qemu-mipsel
-          file host-helper/qemu-mipsel
-          if ldd host-helper/qemu-mipsel 2>&1 | grep -vq 'not a dynamic executable'; then
-            echo 'qemu-mipsel is not static' >&2
-            exit 1
-          fi
+          file host-helper/qemu-mipsel | tee host-helper/file.txt
+          grep -Eq 'static-pie linked|statically linked' host-helper/file.txt
           sha256sum host-helper/qemu-mipsel > host-helper/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
