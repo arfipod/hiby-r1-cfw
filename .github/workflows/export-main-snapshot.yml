@@ -1,0 +1,35 @@
+name: Export main-equivalent source snapshot
+
+on:
+  push:
+    branches:
+      - agent/r1-connectivity-suite
+    paths:
+      - .github/workflows/export-main-snapshot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tree matches merged main tree
+        run: |
+          set -eux
+          test "$(git rev-parse HEAD^{tree})" = "e4078d44d0758bfacbf429cf0ddb3ca13490da9c"
+      - name: Package source
+        run: |
+          set -eux
+          mkdir -p snapshot
+          tar --exclude=.git --exclude=snapshot -czf snapshot/hiby-r1-cfw-main-tree-e4078d44.tar.gz .
+          sha256sum snapshot/hiby-r1-cfw-main-tree-e4078d44.tar.gz > snapshot/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-cfw-main-tree-e4078d44
+          path: snapshot
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
