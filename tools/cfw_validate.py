@@ -459,6 +459,17 @@ class QemuSession:
         if self.process is not None:
             raise ValidationError(f"session {self.name} is already running")
         self.runtime.parent.mkdir(parents=True, exist_ok=True)
+        # Several validation sessions deliberately reuse the same persistent
+        # runtime so launcher/user-data state survives a restart. Volatile
+        # framebuffer telemetry must not survive: otherwise the render-loop
+        # readiness fallback could accept the previous process's final frame
+        # before the new runner has reset its diagnostics.
+        try:
+            self.frame_state.unlink(missing_ok=True)
+        except OSError as error:
+            raise ValidationError(
+                f"cannot clear stale frame state for {self.name}: {error}"
+            ) from error
         log_path = self.evidence.logs_dir / f"{self.name}.log"
         self.log_path = log_path
         self.log_stream = log_path.open("w", encoding="utf-8")
