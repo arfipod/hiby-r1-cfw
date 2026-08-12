@@ -1,4 +1,4 @@
-name: Export exact main source snapshot
+name: Export latest exact main source snapshot
 
 on:
   push:
@@ -22,17 +22,17 @@ jobs:
       - name: Verify exact merged main tree
         run: |
           set -eux
-          test "$(git rev-parse HEAD)" = "7fed58438654050f3e69bcb5f0fb0f87553e80b0"
-          test "$(git rev-parse HEAD^{tree})" = "e4078d44d0758bfacbf429cf0ddb3ca13490da9c"
+          test "$(git rev-parse HEAD)" = "6c1862132316a3a3a4eeb9cd414e6bdb94a8638c"
+          test "$(git rev-parse HEAD^{tree})" = "f32b20b16b772ff918854469136de7a634b784a9"
       - name: Package source
         run: |
           set -eux
           mkdir -p snapshot
-          tar --exclude=.git --exclude=snapshot -czf snapshot/hiby-r1-cfw-main-7fed5843.tar.gz .
-          sha256sum snapshot/hiby-r1-cfw-main-7fed5843.tar.gz > snapshot/SHA256SUMS
+          tar --exclude=.git --exclude=snapshot -czf snapshot/hiby-r1-cfw-main-6c186213.tar.gz .
+          sha256sum snapshot/hiby-r1-cfw-main-6c186213.tar.gz > snapshot/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: hiby-r1-cfw-main-7fed5843
+          name: hiby-r1-cfw-main-6c186213
           path: snapshot
           if-no-files-found: error
           compression-level: 0
