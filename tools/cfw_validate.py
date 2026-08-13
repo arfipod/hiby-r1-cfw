@@ -459,6 +459,17 @@ class QemuSession:
         if self.process is not None:
             raise ValidationError(f"session {self.name} is already running")
         self.runtime.parent.mkdir(parents=True, exist_ok=True)
+        # Several validation sessions deliberately reuse the same persistent
+        # runtime so launcher/user-data state survives a restart. Volatile
+        # framebuffer telemetry must not survive: otherwise the render-loop
+        # readiness fallback could accept the previous process's final frame
+        # before the new runner has reset its diagnostics.
+        try:
+            self.frame_state.unlink(missing_ok=True)
+        except OSError as error:
+            raise ValidationError(
+                f"cannot clear stale frame state for {self.name}: {error}"
+            ) from error
         log_path = self.evidence.logs_dir / f"{self.name}.log"
         self.log_path = log_path
         self.log_stream = log_path.open("w", encoding="utf-8")
@@ -541,9 +552,21 @@ class QemuSession:
                 last_text = ""
             if PLAYER_READY_MARKER in last_text:
                 return
+            # The vendor player writes its readiness printf through buffered
+            # stdio under qemu-user, so a non-TTY validation run can render
+            # the launcher without flushing that diagnostic line. The fbdev
+            # shim sequence is a stronger runtime signal: three completed
+            # presents mean the real player reached its UI render loop.
+            try:
+                _yoffset, sequence = nav.read_frame_state(self.frame_state)
+                if sequence >= 3:
+                    return
+            except (OSError, RuntimeError, ValueError):
+                pass
             time.sleep(0.05)
         raise ValidationError(
-            f"session {self.name} did not reach the player readiness marker; "
+            f"session {self.name} did not reach the player readiness marker "
+            "or render-loop fallback; "
             f"log_tail={last_text[-500:]!r}"
         )
 
