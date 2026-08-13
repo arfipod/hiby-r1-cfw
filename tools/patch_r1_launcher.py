@@ -457,7 +457,8 @@ def render_layout(mask: int, theme: ThemeSpec) -> bytes:
         ("scroll_max_y", 50),
         ("scroll_min_y", 50),
         ("scroll_max_x", 0),
-        ("scroll_min_x", 0),
+        # Preserve the stock launcher/Now Playing horizontal page range.
+        ("scroll_min_x", -480),
     ]
     if theme.background is not None:
         properties.append(("color", theme.background))
