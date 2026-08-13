@@ -183,6 +183,8 @@ class R1LauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(750, root.properties["h"])
                 self.assertEqual(50, root.properties["scroll_min_y"])
+                self.assertEqual(0, root.properties["scroll_max_x"])
+                self.assertEqual(-480, root.properties["scroll_min_x"])
                 self.assertEqual("scroll", root.properties["flag"])
                 step = actual_groups[2]
                 self.assertEqual("launcher_apps_vg_step", step.name)
