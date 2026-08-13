@@ -1,0 +1,92 @@
+name: Apply four-tile Now Playing layout fix
+
+on:
+  push:
+    branches:
+      - fix/four-tile-now-playing-swipe
+    paths:
+      - .github/workflows/apply-four-tile-now-playing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/four-tile-now-playing-swipe
+          fetch-depth: 0
+
+      - name: Apply the reviewed launcher range fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          replacements = {
+              "tools/patch_r1_launcher.py": [
+                  (
+                      '        ("scroll_max_x", 0),\n        ("scroll_min_x", 0),',
+                      '        ("scroll_max_x", 0),\n'
+                      '        # The vendor launcher and Now Playing page are the two horizontal\n'
+                      '        # pages of this hgl_view. Keeping the stock -480 lower bound is\n'
+                      '        # required for a completed left swipe to settle on Now Playing; a\n'
+                      '        # zero lower bound leaves LiteGUI at a stable half-screen blend.\n'
+                      '        ("scroll_min_x", -480),',
+                  )
+              ],
+              "tools/patch_r1_retro_launcher.py": [
+                  (
+                      '        ("scroll_max_x", 0),\n        ("scroll_min_x", 0),',
+                      '        ("scroll_max_x", 0),\n'
+                      '        # Match the stock horizontal launcher/Now Playing page range.\n'
+                      '        ("scroll_min_x", -480),',
+                  )
+              ],
+              "tests/test_patch_r1_launcher.py": [
+                  (
+                      '                self.assertEqual(50, root.properties["scroll_min_y"])\n'
+                      '                self.assertEqual("scroll", root.properties["flag"])',
+                      '                self.assertEqual(50, root.properties["scroll_min_y"])\n'
+                      '                self.assertEqual(0, root.properties["scroll_max_x"])\n'
+                      '                self.assertEqual(-480, root.properties["scroll_min_x"])\n'
+                      '                self.assertEqual("scroll", root.properties["flag"])',
+                  ),
+                  (
+                      '                    self.assertEqual(0, root.properties["scroll_max_x"])\n'
+                      '                    self.assertEqual(0, root.properties["scroll_min_x"])',
+                      '                    self.assertEqual(0, root.properties["scroll_max_x"])\n'
+                      '                    self.assertEqual(-480, root.properties["scroll_min_x"])',
+                  ),
+              ],
+              "tests/test_retro_theme_integration.py": [
+                  (
+                      '        self.assertIn(\'"name":"launcher_apps_vg_step"\', compact)\n',
+                      '        self.assertIn(\'"name":"launcher_apps_vg_step"\', compact)\n'
+                      '        self.assertIn(\'"scroll_min_x":-480\', compact)\n',
+                  )
+              ],
+          }
+
+          for filename, edits in replacements.items():
+              path = Path(filename)
+              text = path.read_text(encoding="utf-8")
+              for old, new in edits:
+                  if text.count(old) != 1:
+                      raise SystemExit(f"expected exactly one match in {filename}: {old!r}")
+                  text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8")
+
+      - name: Run focused launcher tests
+        run: python3 -m unittest tests.test_patch_r1_launcher tests.test_retro_theme_integration
+
+      - name: Commit the fix and remove this staging workflow
+        run: |
+          set -eux
+          rm -f .github/workflows/apply-four-tile-now-playing.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix four-tile launcher swipe to Now Playing"
+          git push origin HEAD:fix/four-tile-now-playing-swipe
