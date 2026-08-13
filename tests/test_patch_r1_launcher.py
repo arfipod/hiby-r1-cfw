@@ -233,7 +233,7 @@ class R1LauncherTests(unittest.TestCase):
                     self.assertEqual(50, root.properties["scroll_max_y"])
                     self.assertEqual(50, root.properties["scroll_min_y"])
                     self.assertEqual(0, root.properties["scroll_max_x"])
-                    self.assertEqual(0, root.properties["scroll_min_x"])
+                    self.assertEqual(-480, root.properties["scroll_min_x"])
                     self.assertEqual("scroll", root.properties["flag"])
                     for key in ("content_x", "content_y", "content_w", "content_h"):
                         self.assertNotIn(key, root.properties)

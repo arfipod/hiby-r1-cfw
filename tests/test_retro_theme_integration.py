@@ -55,6 +55,7 @@ class RetroThemeIntegrationTests(unittest.TestCase):
         self.assertIn("launcher\\\\tile_cfw.png", compact)
         self.assertIn("launcher\\\\tile_about_wide.png", compact)
         self.assertIn('"name":"launcher_apps_vg_step"', compact)
+        self.assertIn('"scroll_min_x":-480', compact)
 
         six_tiles = retro_launcher.render_layout(0x77).decode("utf-8")
         self.assertNotIn("_wide.png", six_tiles)
