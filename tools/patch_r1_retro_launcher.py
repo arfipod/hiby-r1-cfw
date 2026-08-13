@@ -105,7 +105,8 @@ def render_layout(mask: int) -> bytes:
         ("scroll_max_y", 50),
         ("scroll_min_y", 50),
         ("scroll_max_x", 0),
-        ("scroll_min_x", 0),
+        # Preserve the stock launcher/Now Playing horizontal page range.
+        ("scroll_min_x", -480),
         ("color", RETRO_BACKGROUND),
         ("flag", "scroll"),
         ("zorder", -9),
