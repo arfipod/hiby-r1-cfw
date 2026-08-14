@@ -1,0 +1,39 @@
+name: Temporary source export
+
+on:
+  push:
+    branches:
+      - agent/source-export-20260814
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record and archive exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/HEAD.txt"
+          git status --porcelain=v1 | tee "$RUNNER_TEMP/status.txt"
+          test ! -s "$RUNNER_TEMP/status.txt"
+          git archive --format=tar.gz --prefix=hiby-r1-cfw/ --output="$RUNNER_TEMP/hiby-r1-cfw-source.tar.gz" HEAD
+
+      - name: Upload exact source
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-cfw-source-export
+          path: |
+            ${{ runner.temp }}/hiby-r1-cfw-source.tar.gz
+            ${{ runner.temp }}/HEAD.txt
+            ${{ runner.temp }}/status.txt
+          retention-days: 1
+          if-no-files-found: error
