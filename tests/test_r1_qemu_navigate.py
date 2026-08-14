@@ -201,6 +201,58 @@ class R1QemuNavigateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "invalid frame state header"):
                 navigate.capture_coherent_frame(framebuffer, state)
 
+    def test_input_state_validation_detects_stale_grab_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "input-state.bin"
+            state.write_bytes(
+                navigate.bridge.INPUT_STATE.pack(
+                    navigate.bridge.INPUT_STATE_MAGIC,
+                    1,
+                    9,
+                    1234,
+                    3,
+                    17,
+                    1,
+                )
+            )
+            parsed = navigate.read_input_state(state)
+            self.assertEqual(9, parsed.sequence)
+            self.assertEqual(1234, parsed.process_id)
+            self.assertEqual(3, parsed.open_count)
+            self.assertEqual(17, parsed.grab_fd)
+            self.assertTrue(parsed.grabbed)
+
+            state.write_bytes(
+                navigate.bridge.INPUT_STATE.pack(
+                    navigate.bridge.INPUT_STATE_MAGIC,
+                    1,
+                    10,
+                    1234,
+                    3,
+                    -1,
+                    0,
+                )
+            )
+            self.assertFalse(navigate.read_input_state(state).grabbed)
+
+            state.write_bytes(
+                navigate.bridge.INPUT_STATE.pack(
+                    navigate.bridge.INPUT_STATE_MAGIC,
+                    1,
+                    11,
+                    1234,
+                    3,
+                    17,
+                    0,
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "retains owner"):
+                navigate.read_input_state(state)
+
+            state.write_bytes(b"short")
+            with self.assertRaisesRegex(RuntimeError, "input state size"):
+                navigate.read_input_state(state)
+
     def test_timed_tap_and_drag_emit_ordered_touch_phases(self) -> None:
         events: list[tuple[int, int, str]] = []
 

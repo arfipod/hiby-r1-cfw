@@ -449,6 +449,10 @@ class QemuSession:
         return self.runtime / "touch/event0"
 
     @property
+    def input_state_path(self) -> Path:
+        return self.runtime / "input-state.bin"
+
+    @property
     def semantic_path(self) -> Path:
         return self.runtime / "cfw-state.bin"
 
@@ -460,16 +464,17 @@ class QemuSession:
         if self.process is not None:
             raise ValidationError(f"session {self.name} is already running")
         self.runtime.parent.mkdir(parents=True, exist_ok=True)
-        # Persistent runtime state intentionally survives selected restart tests,
-        # but readiness telemetry belongs to exactly one player process. Clear it
-        # before spawning so the render fallback cannot accept the final present
-        # from a previous run while the shell runner is still starting.
-        try:
-            self.frame_state.unlink(missing_ok=True)
-        except OSError as error:
-            raise ValidationError(
-                f"cannot clear stale frame state for {self.name}: {error}"
-            ) from error
+        # Persistent user state intentionally survives selected restart tests,
+        # but process telemetry belongs to exactly one player invocation. Clear
+        # it before spawning so neither readiness nor touch-ownership checks can
+        # accept the previous process's final record while the runner starts.
+        for telemetry in (self.frame_state, self.input_state_path):
+            try:
+                telemetry.unlink(missing_ok=True)
+            except OSError as error:
+                raise ValidationError(
+                    f"cannot clear stale telemetry {telemetry} for {self.name}: {error}"
+                ) from error
         self.readiness_signal = None
         log_path = self.evidence.logs_dir / f"{self.name}.log"
         self.log_path = log_path
@@ -496,6 +501,9 @@ class QemuSession:
         )
         self.wait_player_ready()
         snapshot = self.wait_stable_frame()
+        self.wait_input_state(
+            grabbed=False, minimum_open_count=1, timeout=self.boot_timeout
+        )
         if stock_launcher:
             classification = nav.classify_launcher(snapshot.image)
             if not classification.matched:
@@ -537,6 +545,44 @@ class QemuSession:
     def capture(self) -> Any:
         self.assert_alive()
         return nav.capture_coherent_frame(self.framebuffer, self.frame_state)
+
+    def input_state(self) -> Any:
+        self.assert_alive()
+        return nav.read_input_state(self.input_state_path)
+
+    def wait_input_state(
+        self,
+        *,
+        grabbed: bool,
+        after_sequence: int | None = None,
+        minimum_open_count: int = 1,
+        timeout: float | None = None,
+    ) -> Any:
+        deadline = time.monotonic() + (
+            self.transition_timeout if timeout is None else timeout
+        )
+        last: Any | None = None
+        last_error: BaseException | None = None
+        while time.monotonic() < deadline:
+            self.assert_alive()
+            try:
+                last = nav.read_input_state(self.input_state_path)
+                sequence_ok = (
+                    after_sequence is None or last.sequence > after_sequence
+                )
+                if (
+                    sequence_ok
+                    and last.grabbed is grabbed
+                    and last.open_count >= minimum_open_count
+                ):
+                    return last
+            except (OSError, RuntimeError) as error:
+                last_error = error
+            time.sleep(0.04)
+        raise ValidationError(
+            f"session {self.name} touch ownership did not settle to "
+            f"grabbed={grabbed}; last={last}, error={last_error}"
+        )
 
     def wait_player_ready(self) -> None:
         if self.log_path is None:
@@ -1408,6 +1454,7 @@ def safe_launcher_mask(mask: int) -> bool:
 
 def open_cfw(session: QemuSession, point: tuple[int, int]) -> tuple[Any, SemanticState]:
     launcher = session.wait_stable_frame()
+    touch_before = session.wait_input_state(grabbed=False)
     session.clear_semantic()
     session.tap(*point)
     state = session.wait_semantic(
@@ -1416,6 +1463,7 @@ def open_cfw(session: QemuSession, point: tuple[int, int]) -> tuple[Any, Semanti
         label="open CFW",
     )
     session.wait_change(launcher.content_sha256)
+    session.wait_input_state(grabbed=True, after_sequence=touch_before.sequence)
     return launcher, state
 
 
@@ -1450,6 +1498,7 @@ def leave_cfw(session: QemuSession, launcher_hash: str) -> tuple[SemanticState, 
         label="root Back",
     )
     restored = session.wait_hash(launcher_hash)
+    session.wait_input_state(grabbed=False)
     return final, restored
 
 
@@ -1838,6 +1887,7 @@ def validate_crash_recovery(session: QemuSession, evidence: Evidence) -> None:
         label="forced-crash sidecar open",
     )
     restored = session.wait_hash(launcher.content_sha256)
+    touch = session.wait_input_state(grabbed=False)
     session.assert_alive()
 
     # A stock route after the forced child exit proves that input ownership was
@@ -1851,6 +1901,7 @@ def validate_crash_recovery(session: QemuSession, evidence: Evidence) -> None:
         forced_signal="SIGABRT",
         semantic_state=state.as_dict(),
         restored_content_sha256=restored.content_sha256,
+        touch_state=touch.metadata(),
         stock_player_alive=True,
         touch_route_after_crash="Music",
         screenshot=music_path,

@@ -280,8 +280,8 @@ done
 # Child programs inherit the preload, so only the host runner may reset shared
 # diagnostics.  Exact disposable targets are used; the extracted firmware and
 # the source MP3 are never modified.
-truncate -s 0 "$runtime/frame-state.bin" "$runtime/input-ioctl.bin" \
-    "$runtime/input-events.bin" "$runtime/crash-state.bin" "$runtime/framebuffer.raw" \
+truncate -s 0 "$runtime/frame-state.bin" "$runtime/input-state.bin" \
+    "$runtime/input-ioctl.bin" "$runtime/input-events.bin" "$runtime/crash-state.bin" "$runtime/framebuffer.raw" \
     "$runtime/hgl-dma.raw" "$runtime/cfw-state.bin"
 
 guest_preload=/tmp/r1-ui-lib/libr1-qemu-fbshim.so
@@ -297,6 +297,7 @@ guest_environment="$guest_environment,QEMU_LD_PREFIX=/"
 guest_environment="$guest_environment,R1_QEMU_FB_PATH=/tmp/r1-ui-run/framebuffer.raw"
 guest_environment="$guest_environment,R1_QEMU_DMA_PATH=/tmp/r1-ui-run/hgl-dma.raw"
 guest_environment="$guest_environment,R1_QEMU_STATE_PATH=/tmp/r1-ui-run/frame-state.bin"
+guest_environment="$guest_environment,R1_QEMU_INPUT_STATE_PATH=/tmp/r1-ui-run/input-state.bin"
 guest_environment="$guest_environment,R1_QEMU_TOUCH_PATH=/tmp/r1-ui-run/touch/event0"
 guest_environment="$guest_environment,R1_QEMU_INPUT_LOG_PATH=/tmp/r1-ui-run/input-ioctl.bin"
 guest_environment="$guest_environment,R1_QEMU_INPUT_EVENT_LOG_PATH=/tmp/r1-ui-run/input-events.bin"
@@ -347,6 +348,7 @@ echo "simulated microSD present: $sd_present"
 echo "root backend: $root_backend"
 echo "framebuffer: $runtime/framebuffer.raw"
 echo "frame state: $runtime/frame-state.bin"
+echo "input state: $runtime/input-state.bin"
 echo "CFW semantic state: $runtime/cfw-state.bin"
 echo "touch FIFO: $touch_fifo"
 echo "start the viewer in another terminal:"

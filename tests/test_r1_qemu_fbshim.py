@@ -41,6 +41,11 @@ class R1QEMUFramebufferHandoffSourceTests(unittest.TestCase):
         self.assertIn("owner >= 0 && owner != fd", shim)
         self.assertIn("flush_input_queues();", shim)
         self.assertIn("errno = EBUSY", shim)
+        self.assertIn('"R1_QEMU_INPUT_STATE_PATH"', shim)
+        self.assertIn("struct r1_input_state", shim)
+        self.assertIn("publish_input_state_locked();", shim)
+        self.assertIn("state.grab_fd = input_grab_fd", shim)
+        self.assertIn("state.open_count = open_count", shim)
 
 
 class R1QEMUFramebufferHandoffIntegrationTests(unittest.TestCase):

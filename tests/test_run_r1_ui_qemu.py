@@ -65,6 +65,14 @@ class R1QemuRunnerPlanTests(unittest.TestCase):
         self.assertIn("QEMU_LD_PREFIX=/", self.script)
         self.assertIn('"$runtime/hgl-dma.raw" "$runtime/cfw-state.bin"', self.script)
 
+    def test_touch_ownership_telemetry_is_reset_and_guest_scoped(self) -> None:
+        self.assertIn('"$runtime/input-state.bin"', self.script)
+        self.assertIn(
+            "R1_QEMU_INPUT_STATE_PATH=/tmp/r1-ui-run/input-state.bin",
+            self.script,
+        )
+        self.assertIn('echo "input state: $runtime/input-state.bin"', self.script)
+
     def test_forced_sidecar_crash_control_is_validated_and_guest_scoped(self) -> None:
         self.assertIn("cfw_crash_after_ms=${R1_QEMU_CFW_CRASH_AFTER_MS:-}", self.script)
         self.assertIn("must be an integer from 1 to 3600000", self.script)

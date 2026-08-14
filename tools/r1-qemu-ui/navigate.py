@@ -552,6 +552,59 @@ def capture_coherent_frame(
     )
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class InputState:
+    sequence: int
+    process_id: int
+    open_count: int
+    grab_fd: int
+    grabbed: bool
+
+    def metadata(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def read_input_state(path: Path) -> InputState:
+    """Read the fbshim touch-open/EVIOCGRAB telemetry record strictly."""
+
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot read input state {path}: {error}") from error
+    if len(data) != bridge.INPUT_STATE.size:
+        raise RuntimeError(
+            f"invalid input state size {path}: {len(data)} != {bridge.INPUT_STATE.size}"
+        )
+    magic, version, sequence, process_id, open_count, grab_fd, grabbed = (
+        bridge.INPUT_STATE.unpack(data)
+    )
+    if magic != bridge.INPUT_STATE_MAGIC or version != 1:
+        raise RuntimeError(
+            f"invalid input state header: magic=0x{magic:08x}, version={version}"
+        )
+    if process_id <= 0:
+        raise RuntimeError(f"invalid input-state process id: {process_id}")
+    if not 0 <= open_count <= 16:
+        raise RuntimeError(f"invalid input-state open count: {open_count}")
+    if grabbed not in (0, 1):
+        raise RuntimeError(f"invalid input-state grabbed flag: {grabbed}")
+    if grabbed and (grab_fd < 0 or open_count == 0):
+        raise RuntimeError(
+            f"inconsistent grabbed input state: fd={grab_fd}, opens={open_count}"
+        )
+    if not grabbed and grab_fd != -1:
+        raise RuntimeError(f"ungrabbed input state retains owner fd {grab_fd}")
+    return InputState(
+        sequence=int(sequence),
+        process_id=int(process_id),
+        open_count=int(open_count),
+        grab_fd=int(grab_fd),
+        grabbed=bool(grabbed),
+    )
+
+
 def timed_tap(
     touch_fifo: Path,
     point: Point,

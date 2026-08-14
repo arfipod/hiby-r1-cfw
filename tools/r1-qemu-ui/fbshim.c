@@ -42,11 +42,13 @@
 #define R1_DEFAULT_FRAMEBUFFER_PATH "/tmp/r1-qemu-framebuffer.raw"
 #define R1_DEFAULT_DMA_PATH "/tmp/r1-qemu-hgl-dma"
 #define R1_DEFAULT_STATE_PATH "/tmp/r1-qemu-frame-state"
+#define R1_DEFAULT_INPUT_STATE_PATH "/tmp/r1-qemu-input-state"
 #define R1_DEFAULT_TOUCH_PATH "/tmp/r1-qemu-touch.fifo"
 #define R1_INHERITED_FRAMEBUFFER_FD_ENV "R1_QEMU_INHERITED_FB_FD"
 #define R1_MAX_FRAMEBUFFER_FDS 16U
 #define R1_MAX_INPUT_FDS 16U
 #define R1_FRAME_STATE_MAGIC 0x52314642U
+#define R1_INPUT_STATE_MAGIC 0x52314953U
 #define R1_CRASH_STATE_MAGIC 0x52314352U
 #define R1_INPUT_EVENT_MAGIC 0x52314556U
 
@@ -68,6 +70,16 @@ struct r1_frame_state {
     uint32_t sequence;
 };
 
+struct r1_input_state {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t sequence;
+    uint32_t process_id;
+    uint32_t open_count;
+    int32_t grab_fd;
+    uint32_t grabbed;
+};
+
 struct r1_input_event_log {
     uint32_t magic;
     int32_t fd;
@@ -87,6 +99,7 @@ static int primary_framebuffer_fd = -1;
 static int framebuffer_fds[R1_MAX_FRAMEBUFFER_FDS];
 static int hgl_dma_fd = -1;
 static int frame_state_fd = -1;
+static int input_state_fd = -1;
 static int input_log_fd = -1;
 static int input_event_log_fd = -1;
 static int crash_log_fd = -1;
@@ -99,6 +112,7 @@ static int input_fds[R1_MAX_INPUT_FDS];
 static int input_grab_fd = -1;
 static int input_grab_lock;
 static unsigned input_open_serial;
+static uint32_t input_state_sequence;
 static uint32_t current_yoffset;
 static uint32_t frame_sequence;
 static uint8_t *primary_framebuffer_mapping;
@@ -132,6 +146,27 @@ static void lock_input_grab(void)
 static void unlock_input_grab(void)
 {
     __sync_lock_release(&input_grab_lock);
+}
+
+static void publish_input_state_locked(void)
+{
+    struct r1_input_state state;
+    unsigned index;
+    unsigned open_count = 0;
+    if (input_state_fd < 0)
+        return;
+    for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
+        if (__sync_fetch_and_add(&input_fds[index], 0) != 0)
+            ++open_count;
+    }
+    state.magic = R1_INPUT_STATE_MAGIC;
+    state.version = 1;
+    state.sequence = ++input_state_sequence;
+    state.process_id = (uint32_t)getpid();
+    state.open_count = open_count;
+    state.grab_fd = input_grab_fd;
+    state.grabbed = input_grab_fd >= 0 ? 1U : 0U;
+    (void)next_pwrite(input_state_fd, &state, sizeof(state), 0);
 }
 
 static void resolve_symbols(void)
@@ -380,6 +415,7 @@ static int register_inherited_framebuffer(void)
 
 __attribute__((constructor)) static void initialize_shim(void)
 {
+    const char *input_state_path;
     const char *input_log_path;
     const char *input_event_log_path;
     const char *crash_log_path;
@@ -394,6 +430,10 @@ __attribute__((constructor)) static void initialize_shim(void)
      * construct this shim too, so truncating here would erase live state from
      * the main process.  The host runner clears these files once per session. */
     frame_state_fd = next_open(state_path, O_RDWR | O_CREAT, 0600);
+    input_state_path = getenv("R1_QEMU_INPUT_STATE_PATH");
+    if (!input_state_path || !*input_state_path)
+        input_state_path = R1_DEFAULT_INPUT_STATE_PATH;
+    input_state_fd = next_open(input_state_path, O_RDWR | O_CREAT, 0600);
     input_log_path = getenv("R1_QEMU_INPUT_LOG_PATH");
     if (input_log_path && *input_log_path)
         input_log_fd = next_open(input_log_path, O_WRONLY | O_CREAT, 0600);
@@ -490,6 +530,7 @@ static int record_input_open(const char *path, int result)
     lock_input_grab();
     for (index = 0; index < R1_MAX_INPUT_FDS; ++index) {
         if (__sync_bool_compare_and_swap(&input_fds[index], 0, result + 1)) {
+            publish_input_state_locked();
             unlock_input_grab();
             return result;
         }
@@ -705,6 +746,7 @@ int close(int fd)
             break;
     }
     (void)__sync_bool_compare_and_swap(&input_grab_fd, fd, -1);
+    publish_input_state_locked();
     unlock_input_grab();
     return next_close(fd);
 }
@@ -978,6 +1020,7 @@ static int input_ioctl(int fd, unsigned long request, void *argument)
         if (requested) {
             if (owner == fd || owner < 0) {
                 input_grab_fd = fd;
+                publish_input_state_locked();
                 unlock_input_grab();
                 return 0;
             }
@@ -991,6 +1034,7 @@ static int input_ioctl(int fd, unsigned long request, void *argument)
             * broadcast endpoint before stock delivery resumes. */
             flush_input_queues();
             input_grab_fd = -1;
+            publish_input_state_locked();
             unlock_input_grab();
             return 0;
         }

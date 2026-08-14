@@ -333,6 +333,18 @@ class CfwQemuValidationTests(unittest.TestCase):
                 cfw_events.append("wait-stable")
                 return launcher
 
+            def wait_input_state(
+                self,
+                *,
+                grabbed: bool,
+                after_sequence: int | None = None,
+                minimum_open_count: int = 1,
+                timeout: float | None = None,
+            ) -> object:
+                del minimum_open_count, timeout
+                cfw_events.append(("wait-input", grabbed, after_sequence))
+                return SimpleNamespace(sequence=7 if not grabbed else 8)
+
             def clear_semantic(self) -> None:
                 cfw_events.append("clear-semantic")
 
@@ -355,10 +367,12 @@ class CfwQemuValidationTests(unittest.TestCase):
         self.assertEqual(
             [
                 "wait-stable",
+                ("wait-input", False, None),
                 "clear-semantic",
                 ("tap", 120, 665),
                 ("wait-semantic", "open CFW"),
                 ("wait-change", launcher_hash),
+                ("wait-input", True, 7),
             ],
             cfw_events,
         )
@@ -453,20 +467,23 @@ class CfwQemuValidationTests(unittest.TestCase):
             )
             session.runtime.mkdir(parents=True)
             session.frame_state.write_bytes(b"stale previous process telemetry")
-            observed: list[bool] = []
+            session.input_state_path.write_bytes(b"stale touch ownership")
+            observed: list[tuple[bool, bool]] = []
 
             def fake_popen(*_args: object, **_kwargs: object) -> object:
-                observed.append(session.frame_state.exists())
+                observed.append(
+                    (session.frame_state.exists(), session.input_state_path.exists())
+                )
                 return SimpleNamespace(poll=lambda: None)
 
             with mock.patch.object(
                 validation.subprocess, "Popen", side_effect=fake_popen
             ), mock.patch.object(session, "wait_player_ready"), mock.patch.object(
                 session, "wait_stable_frame", return_value="ready"
-            ):
+            ), mock.patch.object(session, "wait_input_state"):
                 self.assertEqual("ready", session.start())
 
-            self.assertEqual([False], observed)
+            self.assertEqual([(False, False)], observed)
             session.process = None
             if session.log_stream is not None:
                 session.log_stream.close()
