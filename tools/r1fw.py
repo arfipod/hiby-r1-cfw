@@ -70,13 +70,18 @@ def _rock_ridge_timestamps(epoch: int) -> tuple[bytes, bytes]:
 
 
 def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
-    """Normalize Rock Ridge TF fields without touching ISO payload bytes.
+    """Normalize ISO9660 directory and Rock Ridge timestamps atomically.
 
-    genisoimage records host ctime and the atime caused by its own reads in
-    Rock Ridge ``TF`` entries. Those values cannot be set with ``os.utime`` and
-    otherwise make byte-identical firmware builds differ. This parser walks
-    only ISO9660 directory System Use areas (including SUSP continuations), so
-    a payload byte sequence that happens to resemble ``TF`` is never changed.
+    cdrkit records the wall clock in every ISO9660 directory record, including
+    the duplicate root record embedded in both the primary and Joliet volume
+    descriptors.  It also records host ctime and the atime caused by its own
+    reads in Rock Ridge ``TF`` entries.  ``os.utime`` cannot make either class
+    reproducible.
+
+    This parser follows only validated directory extents from the primary and
+    supplementary volume descriptors.  Rock Ridge System Use areas (including
+    SUSP continuations) are parsed only in the primary tree, so payload bytes
+    that merely resemble a directory record or ``TF`` entry are never touched.
     """
 
     if path.is_symlink() or not path.is_file():
@@ -84,30 +89,37 @@ def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
     image = bytearray(path.read_bytes())
     short_timestamp, long_timestamp = _rock_ridge_timestamps(epoch)
 
-    primary_offset = None
+    descriptors: list[tuple[int, int]] = []
     sector = 16
+    saw_terminator = False
     while (sector + 1) * ISO_SECTOR_SIZE <= len(image):
         offset = sector * ISO_SECTOR_SIZE
         descriptor_type = image[offset]
         if image[offset + 1 : offset + 6] != b"CD001" or image[offset + 6] != 1:
             raise RuntimeError(f"invalid ISO9660 volume descriptor at sector {sector}")
-        if descriptor_type == 1 and primary_offset is None:
-            primary_offset = offset
+        if descriptor_type in (1, 2):
+            descriptors.append((descriptor_type, offset))
         if descriptor_type == 255:
+            saw_terminator = True
             break
         sector += 1
-    if primary_offset is None:
+    if not saw_terminator:
+        raise RuntimeError("ISO9660 volume descriptor set is incomplete")
+    if not any(kind == 1 for kind, _offset in descriptors):
         raise RuntimeError("ISO9660 primary volume descriptor is missing")
 
-    root_offset = primary_offset + 156
-    if root_offset >= len(image) or image[root_offset] < 34:
-        raise RuntimeError("ISO9660 root directory record is invalid")
-    root_extent = _both_endian_u32(image, root_offset + 2, "root extent")
-    root_size = _both_endian_u32(image, root_offset + 10, "root size")
-
-    visited_directories: set[tuple[int, int]] = set()
+    visited_directories: set[tuple[int, int, int]] = set()
     visited_continuations: set[tuple[int, int]] = set()
+    normalized_record_offsets: set[int] = set()
     normalized_tf_offsets: set[int] = set()
+
+    def normalize_recording_date(record_offset: int, record_end: int) -> None:
+        timestamp_start = record_offset + 18
+        timestamp_end = timestamp_start + len(short_timestamp)
+        if record_offset < 0 or timestamp_end > record_end or record_end > len(image):
+            raise RuntimeError("truncated ISO9660 recording date")
+        image[timestamp_start:timestamp_end] = short_timestamp
+        normalized_record_offsets.add(record_offset)
 
     def normalize_tf(offset: int, end: int) -> None:
         length = image[offset + 2]
@@ -156,8 +168,14 @@ def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
                     normalize_susp(absolute, continuation_length)
             cursor += entry_length
 
-    def visit_directory(extent: int, directory_size: int) -> None:
-        key = (extent, directory_size)
+    def visit_directory(
+        tree_id: int,
+        extent: int,
+        directory_size: int,
+        *,
+        rock_ridge: bool,
+    ) -> None:
+        key = (tree_id, extent, directory_size)
         if key in visited_directories:
             return
         visited_directories.add(key)
@@ -174,14 +192,16 @@ def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
             record_end = record_offset + record_length
             if record_length < 34 or record_end > base + directory_size:
                 raise RuntimeError("invalid ISO9660 directory record")
+            normalize_recording_date(record_offset, record_end)
             name_length = image[record_offset + 32]
             name_start = record_offset + 33
             name_end = name_start + name_length
             if name_end > record_end:
                 raise RuntimeError("truncated ISO9660 file identifier")
-            system_use_start = name_end + (1 if (33 + name_length) & 1 else 0)
-            if system_use_start < record_end:
-                normalize_susp(system_use_start, record_end - system_use_start)
+            if rock_ridge:
+                system_use_start = name_end + (1 if (33 + name_length) & 1 else 0)
+                if system_use_start < record_end:
+                    normalize_susp(system_use_start, record_end - system_use_start)
 
             flags = image[record_offset + 25]
             identifier = bytes(image[name_start:name_end])
@@ -192,10 +212,33 @@ def normalize_iso_rock_ridge_timestamps(path: Path, epoch: int) -> int:
                 child_size = _both_endian_u32(
                     image, record_offset + 10, "directory size"
                 )
-                visit_directory(child_extent, child_size)
+                visit_directory(
+                    tree_id,
+                    child_extent,
+                    child_size,
+                    rock_ridge=rock_ridge,
+                )
             position += record_length
 
-    visit_directory(root_extent, root_size)
+    for tree_id, (descriptor_type, descriptor_offset) in enumerate(descriptors):
+        root_offset = descriptor_offset + 156
+        if root_offset >= len(image) or image[root_offset] < 34:
+            raise RuntimeError("ISO9660 root directory record is invalid")
+        root_end = root_offset + image[root_offset]
+        if root_end > descriptor_offset + ISO_SECTOR_SIZE:
+            raise RuntimeError("ISO9660 root directory record is truncated")
+        normalize_recording_date(root_offset, root_end)
+        root_extent = _both_endian_u32(image, root_offset + 2, "root extent")
+        root_size = _both_endian_u32(image, root_offset + 10, "root size")
+        visit_directory(
+            tree_id,
+            root_extent,
+            root_size,
+            rock_ridge=descriptor_type == 1,
+        )
+
+    if not normalized_record_offsets:
+        raise RuntimeError("no ISO9660 directory timestamps were found")
     if not normalized_tf_offsets:
         raise RuntimeError("no Rock Ridge TF timestamps were found")
 

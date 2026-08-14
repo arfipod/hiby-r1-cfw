@@ -46,6 +46,203 @@ def make_uimage(payload: bytes, name: bytes = b"CI synthetic kernel") -> bytes:
     return header[:4] + struct.pack(">I", header_crc) + header[8:] + payload
 
 
+def _iso_both_endian_u16(value: int) -> bytes:
+    return value.to_bytes(2, "little") + value.to_bytes(2, "big")
+
+
+def _iso_both_endian_u32(value: int) -> bytes:
+    return value.to_bytes(4, "little") + value.to_bytes(4, "big")
+
+
+def _iso_directory_record(
+    *,
+    extent: int,
+    size: int,
+    identifier: bytes,
+    directory: bool,
+    recording_date: bytes,
+    system_use: bytes = b"",
+) -> bytes:
+    if len(recording_date) != 7:
+        raise ValueError("ISO recording date must be seven bytes")
+    record = bytearray()
+    record.extend((0, 0))
+    record.extend(_iso_both_endian_u32(extent))
+    record.extend(_iso_both_endian_u32(size))
+    record.extend(recording_date)
+    record.extend((0x02 if directory else 0x00, 0, 0))
+    record.extend(_iso_both_endian_u16(1))
+    record.append(len(identifier))
+    record.extend(identifier)
+    if (33 + len(identifier)) & 1:
+        record.append(0)
+    record.extend(system_use)
+    if len(record) & 1:
+        record.append(0)
+    if len(record) > 255:
+        raise ValueError("synthetic ISO directory record is too large")
+    record[0] = len(record)
+    return bytes(record)
+
+
+def _synthetic_iso_with_primary_and_joliet() -> tuple[
+    bytes, list[int], list[int], bytes
+]:
+    sector_size = r1fw.ISO_SECTOR_SIZE
+    image = bytearray(32 * sector_size)
+    old_date = bytes((126, 8, 14, 12, 34, 56, 0))
+    old_tf_date = bytes((124, 1, 2, 3, 4, 5, 0))
+    tf = b"TF" + bytes((12, 1, 0x02)) + old_tf_date
+    recording_offsets: list[int] = []
+    tf_offsets: list[int] = []
+
+    def descriptor(sector: int, kind: int, extent: int) -> None:
+        base = sector * sector_size
+        image[base] = kind
+        image[base + 1 : base + 6] = b"CD001"
+        image[base + 6] = 1
+        root = _iso_directory_record(
+            extent=extent,
+            size=sector_size,
+            identifier=b"\x00",
+            directory=True,
+            recording_date=old_date,
+        )
+        image[base + 156 : base + 156 + len(root)] = root
+        recording_offsets.append(base + 156)
+
+    descriptor(16, 1, 20)
+    descriptor(17, 2, 21)
+    terminator = 18 * sector_size
+    image[terminator] = 255
+    image[terminator + 1 : terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    def write_directory(sector: int, records: list[bytes], rr_indexes: set[int]) -> None:
+        cursor = sector * sector_size
+        for index, record in enumerate(records):
+            image[cursor : cursor + len(record)] = record
+            recording_offsets.append(cursor)
+            if index in rr_indexes:
+                name_length = record[32]
+                system_use = cursor + 33 + name_length
+                if (33 + name_length) & 1:
+                    system_use += 1
+                tf_offsets.append(system_use)
+            cursor += len(record)
+
+    primary_root_records = [
+        _iso_directory_record(
+            extent=20,
+            size=sector_size,
+            identifier=b"\x00",
+            directory=True,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+        _iso_directory_record(
+            extent=20,
+            size=sector_size,
+            identifier=b"\x01",
+            directory=True,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+        _iso_directory_record(
+            extent=22,
+            size=sector_size,
+            identifier=b"SUB",
+            directory=True,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+    ]
+    write_directory(20, primary_root_records, {0, 1, 2})
+
+    primary_child_records = [
+        _iso_directory_record(
+            extent=22,
+            size=sector_size,
+            identifier=b"\x00",
+            directory=True,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+        _iso_directory_record(
+            extent=20,
+            size=sector_size,
+            identifier=b"\x01",
+            directory=True,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+        _iso_directory_record(
+            extent=30,
+            size=64,
+            identifier=b"PAYLOAD.BIN;1",
+            directory=False,
+            recording_date=old_date,
+            system_use=tf,
+        ),
+    ]
+    write_directory(22, primary_child_records, {0, 1, 2})
+
+    joliet_root_records = [
+        _iso_directory_record(
+            extent=21,
+            size=sector_size,
+            identifier=b"\x00",
+            directory=True,
+            recording_date=old_date,
+        ),
+        _iso_directory_record(
+            extent=21,
+            size=sector_size,
+            identifier=b"\x01",
+            directory=True,
+            recording_date=old_date,
+        ),
+        _iso_directory_record(
+            extent=23,
+            size=sector_size,
+            identifier="SUB".encode("utf-16-be"),
+            directory=True,
+            recording_date=old_date,
+        ),
+    ]
+    write_directory(21, joliet_root_records, set())
+
+    joliet_child_records = [
+        _iso_directory_record(
+            extent=23,
+            size=sector_size,
+            identifier=b"\x00",
+            directory=True,
+            recording_date=old_date,
+        ),
+        _iso_directory_record(
+            extent=21,
+            size=sector_size,
+            identifier=b"\x01",
+            directory=True,
+            recording_date=old_date,
+        ),
+        _iso_directory_record(
+            extent=30,
+            size=64,
+            identifier="PAYLOAD.BIN;1".encode("utf-16-be"),
+            directory=False,
+            recording_date=old_date,
+        ),
+    ]
+    write_directory(23, joliet_child_records, set())
+
+    payload = b"payload contains TF\x0c\x01\x02 and an ISO-like date " + old_date
+    payload_offset = 30 * sector_size
+    image[payload_offset : payload_offset + len(payload)] = payload
+    return bytes(image), recording_offsets, tf_offsets, payload
+
+
 class R1FirmwareUnitTests(unittest.TestCase):
     def test_rock_ridge_timestamp_encoding_is_utc_and_bounded(self) -> None:
         short, long = r1fw._rock_ridge_timestamps(1_767_003_664)
@@ -53,6 +250,34 @@ class R1FirmwareUnitTests(unittest.TestCase):
         self.assertEqual(b"2025122910210400\x00", long)
         with self.assertRaisesRegex(RuntimeError, "ISO9660 year range"):
             r1fw._rock_ridge_timestamps(-2_208_988_801)
+
+    def test_iso_directory_and_rock_ridge_timestamps_are_reproducible(self) -> None:
+        image, recording_offsets, tf_offsets, payload = (
+            _synthetic_iso_with_primary_and_joliet()
+        )
+        epoch = 1_767_003_664
+        short, _long = r1fw._rock_ridge_timestamps(epoch)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "synthetic.iso"
+            path.write_bytes(image)
+            path.chmod(0o640)
+
+            normalized_tf = r1fw.normalize_iso_rock_ridge_timestamps(path, epoch)
+            normalized = path.read_bytes()
+            normalized_mode = path.stat().st_mode & 0o777
+
+        self.assertEqual(len(tf_offsets), normalized_tf)
+        self.assertEqual(0o640, normalized_mode)
+        for record_offset in recording_offsets:
+            self.assertEqual(
+                short, normalized[record_offset + 18 : record_offset + 25]
+            )
+        for tf_offset in tf_offsets:
+            self.assertEqual(short, normalized[tf_offset + 5 : tf_offset + 12])
+        payload_offset = 30 * r1fw.ISO_SECTOR_SIZE
+        self.assertEqual(
+            payload, normalized[payload_offset : payload_offset + len(payload)]
+        )
 
     def test_verify_file_accepts_exact_digest_and_size_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
