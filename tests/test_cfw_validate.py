@@ -400,6 +400,78 @@ class CfwQemuValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(validation.ValidationError, "readiness"):
                 session.wait_player_ready()
 
+    def test_rendered_qemu_frame_sequence_is_a_readiness_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = validation.Evidence(root / "artifacts", "render-readiness")
+            session = validation.QemuSession(
+                name="unit",
+                runner=root / "runner",
+                rootfs=root / "rootfs",
+                profile=root / "profile",
+                runtime=root / "runtime",
+                sd_present=True,
+                evidence=evidence,
+                boot_timeout=0.08,
+                transition_timeout=0.05,
+            )
+            session.process = SimpleNamespace(poll=lambda: None)
+            session.log_path = evidence.logs_dir / "unit.log"
+            session.log_path.write_text(
+                "renderer active but stdout buffered\n", encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                validation.nav, "read_frame_state", return_value=(0, 3)
+            ):
+                session.wait_player_ready()
+            self.assertEqual("framebuffer-sequence", session.readiness_signal)
+
+            session.boot_timeout = 0.05
+            with mock.patch.object(
+                validation.nav, "read_frame_state", return_value=(0, 2)
+            ):
+                with self.assertRaisesRegex(
+                    validation.ValidationError, "render-loop fallback"
+                ):
+                    session.wait_player_ready()
+
+    def test_start_discards_stale_frame_state_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = validation.Evidence(root / "artifacts", "restart-state")
+            session = validation.QemuSession(
+                name="restart",
+                runner=root / "runner",
+                rootfs=root / "rootfs",
+                profile=root / "profile",
+                runtime=root / "runtime",
+                sd_present=True,
+                evidence=evidence,
+                boot_timeout=0.08,
+                transition_timeout=0.05,
+            )
+            session.runtime.mkdir(parents=True)
+            session.frame_state.write_bytes(b"stale previous process telemetry")
+            observed: list[bool] = []
+
+            def fake_popen(*_args: object, **_kwargs: object) -> object:
+                observed.append(session.frame_state.exists())
+                return SimpleNamespace(poll=lambda: None)
+
+            with mock.patch.object(
+                validation.subprocess, "Popen", side_effect=fake_popen
+            ), mock.patch.object(session, "wait_player_ready"), mock.patch.object(
+                session, "wait_stable_frame", return_value="ready"
+            ):
+                self.assertEqual("ready", session.start())
+
+            self.assertEqual([False], observed)
+            session.process = None
+            if session.log_stream is not None:
+                session.log_stream.close()
+                session.log_stream = None
+
     def test_fifo_proxy_is_a_bidirectional_private_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

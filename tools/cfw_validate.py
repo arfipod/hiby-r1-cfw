@@ -434,6 +434,7 @@ class QemuSession:
         self.process: subprocess.Popen[str] | None = None
         self.log_stream: Any = None
         self.log_path: Path | None = None
+        self.readiness_signal: str | None = None
 
     @property
     def framebuffer(self) -> Path:
@@ -459,6 +460,17 @@ class QemuSession:
         if self.process is not None:
             raise ValidationError(f"session {self.name} is already running")
         self.runtime.parent.mkdir(parents=True, exist_ok=True)
+        # Persistent runtime state intentionally survives selected restart tests,
+        # but readiness telemetry belongs to exactly one player process. Clear it
+        # before spawning so the render fallback cannot accept the final present
+        # from a previous run while the shell runner is still starting.
+        try:
+            self.frame_state.unlink(missing_ok=True)
+        except OSError as error:
+            raise ValidationError(
+                f"cannot clear stale frame state for {self.name}: {error}"
+            ) from error
+        self.readiness_signal = None
         log_path = self.evidence.logs_dir / f"{self.name}.log"
         self.log_path = log_path
         self.log_stream = log_path.open("w", encoding="utf-8")
@@ -540,10 +552,24 @@ class QemuSession:
             except OSError:
                 last_text = ""
             if PLAYER_READY_MARKER in last_text:
+                self.readiness_signal = "stdout-marker"
                 return
+            # The proprietary player can buffer its diagnostic stdout under
+            # qemu-user. Three validated fbdev presents are a stronger signal
+            # that the real process reached its render loop. ``start`` removes
+            # stale telemetry before spawn, and the following stable-frame gate
+            # also requires a coherent framebuffer before navigation begins.
+            try:
+                _yoffset, sequence = nav.read_frame_state(self.frame_state)
+                if sequence >= 3:
+                    self.readiness_signal = "framebuffer-sequence"
+                    return
+            except (OSError, RuntimeError, ValueError):
+                pass
             time.sleep(0.05)
         raise ValidationError(
-            f"session {self.name} did not reach the player readiness marker; "
+            f"session {self.name} did not reach the player readiness marker "
+            "or render-loop fallback; "
             f"log_tail={last_text[-500:]!r}"
         )
 
