@@ -1,0 +1,59 @@
+name: Export navigation validation kit
+
+on:
+  push:
+    branches:
+      - agent/qemu-navigation-stability
+    paths:
+      - .github/workflows/export-navigation-validation-kit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Record exact main revision
+        run: |
+          set -eux
+          mkdir -p kit/source kit/bin
+          git rev-parse HEAD | tee kit/MAIN_COMMIT
+          git rev-parse HEAD^{tree} | tee kit/MAIN_TREE
+
+      - name: Package exact main source
+        run: |
+          set -eux
+          tar --exclude=.git --exclude=kit -czf kit/source/hiby-r1-cfw-main.tar.gz .
+
+      - name: Install validation host tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            bubblewrap genisoimage openssh-client qemu-user-static squashfs-tools xz-utils
+          cp "$(command -v bwrap)" kit/bin/
+          cp "$(command -v genisoimage)" kit/bin/
+          cp "$(command -v mksquashfs)" kit/bin/
+          cp "$(command -v unsquashfs)" kit/bin/
+          cp "$(command -v qemu-mipsel-static)" kit/bin/qemu-mipsel
+          cp "$(command -v ssh)" kit/bin/
+          cp "$(command -v ssh-keygen)" kit/bin/
+          chmod 0755 kit/bin/*
+          file kit/bin/* | tee kit/HOST_TOOLS_FILE.txt
+          sha256sum kit/bin/* kit/source/* > kit/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r1-navigation-validation-kit
+          path: kit
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
