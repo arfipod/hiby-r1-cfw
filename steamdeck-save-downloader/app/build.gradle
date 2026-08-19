@@ -1,0 +1,20 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.arfipod.decksave'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.arfipod.decksave'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+    }
+}
+
+dependencies {
+    implementation 'com.github.mwiede:jsch:0.2.26'
+}
