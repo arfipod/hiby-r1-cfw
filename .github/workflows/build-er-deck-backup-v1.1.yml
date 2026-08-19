@@ -1,0 +1,37 @@
+name: Build ER Deck Backup v1.1
+
+on:
+  pull_request:
+    branches:
+      - build/export-fc65-source
+    paths:
+      - '.ci-er-deck-backup/**'
+      - '.github/workflows/build-er-deck-backup-v1.1.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK platform
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Restore source
+        run: |
+          cat .ci-er-deck-backup/source.b64.part* | base64 -d > /tmp/source.zip
+          unzip -q /tmp/source.zip -d /tmp/er-backup
+      - name: Build debug APK
+        working-directory: /tmp/er-backup/SteamDeckEldenRingSave
+        run: gradle --no-daemon :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ER-Deck-Backup-1.1.0-apk
+          path: /tmp/er-backup/SteamDeckEldenRingSave/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
