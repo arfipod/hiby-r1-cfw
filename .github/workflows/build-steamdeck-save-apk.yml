@@ -7,6 +7,12 @@ on:
     paths:
       - 'steamdeck-save-downloader/**'
       - '.github/workflows/build-steamdeck-save-apk.yml'
+  pull_request:
+    branches:
+      - build/export-fc65-source
+    paths:
+      - 'steamdeck-save-downloader/**'
+      - '.github/workflows/build-steamdeck-save-apk.yml'
 
 jobs:
   build:
