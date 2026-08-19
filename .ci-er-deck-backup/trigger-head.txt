@@ -1,0 +1,1 @@
+PR-only trigger for ER Deck Backup v1.1.0.
